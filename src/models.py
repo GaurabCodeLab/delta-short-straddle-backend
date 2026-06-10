@@ -24,17 +24,15 @@ class Quote:
 
 
 @dataclass(slots=True)
-class RatioSpread:
-    long_leg: OptionLeg
-    short_leg: OptionLeg
-    short_leg_each_qty: float
-
-
-@dataclass(slots=True)
 class ShortStraddle:
     put_leg: OptionLeg
     call_leg: OptionLeg
 
+
+@dataclass(slots=True)
+class ShortStrangle:
+    put_leg: OptionLeg
+    call_leg: OptionLeg
 
 @dataclass(slots=True)
 class ShortStraddleBreakeven:

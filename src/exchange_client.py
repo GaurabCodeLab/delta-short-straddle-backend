@@ -20,7 +20,6 @@ class ExchangeClientError(RuntimeError):
 class DeltaExchangeClient:
     """
     Thin async wrapper around delta-rest-client sync methods.
-
     This class intentionally keeps all API-shape assumptions in one place.
     If Delta field names differ for your account, adjust mapping here only.
     """

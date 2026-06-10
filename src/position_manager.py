@@ -1,18 +1,11 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import List
 
 from src.exchange_client import DeltaExchangeClient
-from src.models import OptionLeg, RatioSpread, ShortStraddle, ShortStraddleBreakeven
-
-
-@dataclass(slots=True)
-class PositionSnapshot:
-    ratio: RatioSpread
-    total_unrealized_pnl: float
+from src.models import OptionLeg, ShortStraddle, ShortStraddleBreakeven, ShortStrangle
 
 
 class PositionManager:
@@ -154,79 +147,6 @@ class PositionManager:
 
         return float(nearest_put), float(nearest_call)
 
-    async def detect_ratio_spread(self) -> RatioSpread:
-        legs = await self.exchange.parse_option_positions()
-        if not legs:
-            raise RuntimeError("No open option positions found")
-
-        # Expected structure: Nx long + 2Nx short, same expiry and option type.
-        # Long strike can differ from short strike.
-        longs = [x for x in legs if x.size > 0]
-        shorts = [x for x in legs if x.size < 0]
-
-        for long_leg in longs:
-            for short_leg in shorts:
-                same_expiry = (
-                    long_leg.expiry == short_leg.expiry
-                    or long_leg.expiry.date() == short_leg.expiry.date()
-                )
-                same_type = long_leg.option_type == short_leg.option_type
-                long_qty = abs(long_leg.size)
-                short_qty = abs(short_leg.size)
-                if long_qty <= 0:
-                    continue
-
-                # Accept any quantity scale as long as it respects 1:2 principle.
-                # Example: 1:2, 3:6, 7.5:15, etc.
-                ratio_match = math.isclose(
-                    short_qty / long_qty,
-                    2.0,
-                    rel_tol=2e-2,
-                    abs_tol=1e-8,
-                )
-                if same_expiry and same_type and ratio_match:
-                    return RatioSpread(
-                        long_leg=long_leg,
-                        short_leg=short_leg,
-                        short_leg_each_qty=long_qty,
-                    )
-
-        leg_summary = ", ".join(
-            f"pid={x.product_id}|{x.option_type}|strike={x.strike}|exp={x.expiry.isoformat()}|size={x.size}"
-            for x in legs
-        )
-        raise RuntimeError(
-            "No valid Nx long / 2Nx short ratio spread found. Parsed legs: " + leg_summary
-        )
-
-    async def compute_unrealized_pnl(self, ratio: RatioSpread) -> float:
-        # Calculate PnL based on entry price and actual liquidation prices.
-        # Long positions close at best_bid (conservative: worst price when selling)
-        # Short positions close at best_ask (conservative: worst price when buying back)
-        long_q = await self.exchange.get_best_quote(ratio.long_leg.product_id)
-        short_q = await self.exchange.get_best_quote(ratio.short_leg.product_id)
-
-        long_qty = abs(ratio.long_leg.size)
-        short_qty = abs(ratio.short_leg.size)
-
-        # Long leg PnL: (best_bid - entry_price) * qty * contract_value
-        # (position closed by selling at bid price)
-        long_leg_pnl = (
-            long_qty
-            * ratio.long_leg.contract_value
-            * (long_q.best_bid - ratio.long_leg.entry_price)
-        )
-
-        # Short leg PnL: (entry_price - best_ask) * qty * contract_value
-        # (position closed by buying back at ask price)
-        short_leg_pnl = (
-            short_qty
-            * ratio.short_leg.contract_value
-            * (ratio.short_leg.entry_price - short_q.best_ask)
-        )
-
-        return long_leg_pnl + short_leg_pnl
-
     async def detect_short_straddle(self) -> ShortStraddle:
         legs = await self.exchange.parse_option_positions()
         shorts = [x for x in legs if x.size < 0]
@@ -245,6 +165,42 @@ class PositionManager:
             for x in legs
         )
         raise RuntimeError("No short straddle (short put + short call same strike) found. Legs: " + leg_summary)
+
+    async def detect_short_strangle(self) -> ShortStrangle:
+        legs = await self.exchange.parse_option_positions()
+        if not legs:
+            raise RuntimeError("No open option positions found")
+
+        shorts = [x for x in legs if x.size < 0]
+        puts = [x for x in shorts if x.option_type == "put"]
+        calls = [x for x in shorts if x.option_type == "call"]
+
+        # Need current index price to determine OTM status
+        try:
+            index_price = await self.exchange.get_index_price("BTCUSDT")
+        except Exception:
+            index_price = None
+
+        for put_leg in puts:
+            for call_leg in calls:
+                same_expiry = put_leg.expiry.date() == call_leg.expiry.date()
+                if not same_expiry:
+                    continue
+
+                # If index price available, ensure both legs are OTM relative to index
+                if index_price is not None:
+                    is_put_otm = put_leg.strike < index_price
+                    is_call_otm = call_leg.strike > index_price
+                    if not (is_put_otm and is_call_otm):
+                        continue
+
+                return ShortStrangle(put_leg=put_leg, call_leg=call_leg)
+
+        leg_summary = ", ".join(
+            f"pid={x.product_id}|{x.option_type}|strike={x.strike}|size={x.size}"
+            for x in legs
+        )
+        raise RuntimeError("No short strangle (short put + short call OTM same expiry) found. Legs: " + leg_summary)
 
     async def compute_straddle_pnl(self, straddle: ShortStraddle) -> float:
         put_q = await self.exchange.get_best_quote(straddle.put_leg.product_id)

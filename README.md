@@ -1,10 +1,10 @@
-# Delta BTC Options Ratio-Spread Bot
+# Delta BTC Options Short Strangle Bot
 
 Python async trading bot for Delta Exchange BTC options that:
 
-- Detects an existing `1x long + 2x short` ratio spread automatically
-- Watches Delta BTC index price against short strike
-- On first trigger, either exits all positions (`PnL >= 5 USD`) or converts to a short straddle (`PnL < 5 USD`)
+- Detects an existing short strangle automatically
+- Watches Delta BTC index price against both short strikes
+- On first trigger, either exits all positions (`PnL >= 5 USD`) or converts to an iron fly via a short straddle adjustment (`PnL < 5 USD`)
 
 ## Key Features
 
@@ -23,12 +23,7 @@ Python async trading bot for Delta Exchange BTC options that:
 
 ### 1) Initial Position Discovery
 
-The bot scans open option positions and identifies a valid ratio spread where all legs have:
-
-- same strike
-- same expiry
-- same option type (`call` or `put`)
-- net structure: `+1` long, `-2` short (in equivalent quantity units)
+The bot scans open option positions and identifies a valid short strangle where both legs are short, same expiry, and both legs are out-of-the-money relative to BTC index price.
 
 ### 2) First Adjustment Trigger
 
@@ -42,11 +37,12 @@ At trigger:
 - Compute total unrealized PnL from best bid/ask and entry prices
 - If `PnL >= 5` USD: close all positions and stop
 - If `PnL < 5` USD:
-  - close long leg
-  - close one short leg (half of the initial short side)
-  - open new short leg of opposite option type at same strike/expiry
+  - buy back the opposite short leg
+  - keep the breached short leg in place
+  - open the opposite short leg at the same strike to form a short straddle
+  - buy iron fly wings to convert the short straddle into an iron fly
 
-Resulting structure: short straddle (`1x short call + 1x short put`)
+Resulting structure: iron fly after adjustment via a short straddle
 
 ## Setup
 

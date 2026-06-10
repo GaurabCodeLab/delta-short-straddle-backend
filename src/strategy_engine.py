@@ -11,7 +11,6 @@ from src.config import Settings
 from src.exchange_client import DeltaExchangeClient
 from src.order_executor import OrderExecutor
 from src.position_manager import PositionManager
-from src.risk_manager import RiskManager
 
 LOGGER = logging.getLogger(__name__)
 
@@ -21,7 +20,7 @@ class StrategyState:
     triggered: bool = False
     last_index_price: Optional[float] = None
     status_message: str = "starting"
-    action: str = "waiting for ratio spread"
+    action: str = "waiting for short strangle"
     status: str = "initializing"
     trigger_price: Optional[str] = None
     trigger_pnl: Optional[float] = None
@@ -33,13 +32,11 @@ class StrategyEngine:
         exchange: DeltaExchangeClient,
         positions: PositionManager,
         executor: OrderExecutor,
-        risk: RiskManager,
         settings: Settings,
     ) -> None:
         self.exchange = exchange
         self.positions = positions
         self.executor = executor
-        self.risk = risk
         self.settings = settings
         self.state = StrategyState()
         self._adjustment_lock = asyncio.Lock()
@@ -88,25 +85,6 @@ class StrategyEngine:
             return (prev_price<strike and curr_price>=strike) or (curr_price >= strike)
         return False
 
-    async def _close_entire_ratio(self, ratio) -> None:
-        long_qty = abs(ratio.long_leg.size)
-        short_qty = abs(ratio.short_leg.size)
-
-        # Long close = sell. Short close = buy.
-        filled_long = await self.executor.execute_market_single_submission_with_fill_confirmation(
-            product_id=ratio.long_leg.product_id,
-            side="sell",
-            size=long_qty,
-            reduce_only=True,
-        )
-        filled_short = await self.executor.execute_market_single_submission_with_fill_confirmation(
-            product_id=ratio.short_leg.product_id,
-            side="buy",
-            size=short_qty,
-            reduce_only=True,
-        )
-        LOGGER.info("All positions close requested long_filled=%s short_filled=%s", filled_long, filled_short)
-
     async def _close_all_open_option_positions(self) -> None:
         legs = await self.exchange.parse_option_positions()
         if not legs:
@@ -132,84 +110,6 @@ class StrategyEngine:
                     size,
                     side,
                 )
-
-    async def _convert_to_short_straddle(self, ratio) -> None:
-        """
-        Atomic intent:
-        1) Close long leg
-        2) Buy back half short leg
-        3) Open opposite-type short with same qty at same strike/expiry
-        """
-        async with self._adjustment_lock:
-            qty = ratio.short_leg_each_qty
-            if qty <= 0:
-                raise ValueError(f"Invalid conversion quantity: {qty}")
-            # Notional check is intentionally skipped here: straddle conversion is a
-            # risk-reducing hedge on an existing position, not a new speculative bet.
-
-            close_long_side = "sell"
-            close_short_half_side = "buy"
-            open_opposite_short_side = "sell"
-
-            opposite_type = "put" if ratio.short_leg.option_type == "call" else "call"
-            opposite_symbol = ratio.short_leg.symbol
-            if opposite_symbol.startswith("P-"):
-                opposite_symbol = "C-" + opposite_symbol[2:]
-            elif opposite_symbol.startswith("C-"):
-                opposite_symbol = "P-" + opposite_symbol[2:]
-
-            opp_candidates = []
-
-            if not opp_candidates and opposite_symbol:
-                direct = await self.exchange.get_product_by_symbol(opposite_symbol)
-                if isinstance(direct, dict):
-                    opp_candidates.append(direct)
-            if not opp_candidates:
-                raise RuntimeError("Could not find opposite option contract for straddle conversion")
-
-            opposite_product_id = int(opp_candidates[0]["id"])
-
-            LOGGER.info(
-                "Converting ratio spread to short straddle strike=%s qty=%s opposite_type=%s",
-                ratio.short_leg.strike,
-                qty,
-                opposite_type,
-            )
-
-            # Step 1: close long
-            long_filled = await self.executor.execute_market_single_submission_with_fill_confirmation(
-                product_id=ratio.long_leg.product_id,
-                side=close_long_side,
-                size=qty,
-                reduce_only=True,
-            )
-            if long_filled < qty:
-                raise RuntimeError(f"Long close partial after retries: {long_filled}/{qty}")
-
-            # Step 2: close half short
-            short_half_filled = await self.executor.execute_market_single_submission_with_fill_confirmation(
-                product_id=ratio.short_leg.product_id,
-                side=close_short_half_side,
-                size=qty,
-                reduce_only=True,
-            )
-            if short_half_filled < qty:
-                raise RuntimeError(f"Short half close partial after retries: {short_half_filled}/{qty}")
-
-            # Step 3: open opposite short
-            opp_filled = await self.executor.execute_market_single_submission_with_fill_confirmation(
-                product_id=opposite_product_id,
-                side=open_opposite_short_side,
-                size=qty,
-                reduce_only=False,
-            )
-            if opp_filled < qty:
-                raise RuntimeError(f"Opposite short open partial after retries: {opp_filled}/{qty}")
-
-            LOGGER.info(
-                "Conversion complete: short original type + short opposite type at strike=%s",
-                ratio.short_leg.strike,
-            )
 
     async def _convert_short_straddle_to_iron_fly(self, straddle, breakevens) -> tuple[float, float]:
         wing_put_strike, wing_call_strike = await self.positions.nearest_strikes_for_breakeven_points(
@@ -277,60 +177,142 @@ class StrategyEngine:
         )
         return wing_put_strike, wing_call_strike
 
+    async def _convert_strangle_to_straddle_and_iron_fly(self, strangle) -> None:
+        """
+        Atomic flow for strangle adjustment:
+        1) Square off the opposite short leg (the one not breached)
+        2) Sell the opposite option at the same strike to form a short straddle
+        3) Convert the short straddle to an iron fly (buy wings)
+        """
+        async with self._adjustment_lock:
+            remaining_put = await self.positions.find_open_option_leg(
+                option_type="put",
+                strike=strangle.put_leg.strike,
+                expiry=strangle.put_leg.expiry,
+                side="short",
+            )
+            remaining_call = await self.positions.find_open_option_leg(
+                option_type="call",
+                strike=strangle.call_leg.strike,
+                expiry=strangle.call_leg.expiry,
+                side="short",
+            )
+
+            # If put remains, sell call at same strike; if call remains, sell put at same strike
+            if remaining_put is not None and remaining_call is None:
+                base_leg = remaining_put
+                opposite_symbol = base_leg.symbol
+                if opposite_symbol.startswith("P-"):
+                    opposite_symbol = "C-" + opposite_symbol[2:]
+                elif opposite_symbol.startswith("C-"):
+                    opposite_symbol = "P-" + opposite_symbol[2:]
+                direct = await self.exchange.get_product_by_symbol(opposite_symbol)
+                if not isinstance(direct, dict):
+                    raise RuntimeError("Could not find opposite option contract for strangle->straddle conversion")
+                opposite_product_id = int(direct["id"])
+                sell_qty = abs(base_leg.size)
+                sold = await self.executor.execute_market_single_submission_with_fill_confirmation(
+                    product_id=opposite_product_id,
+                    side="sell",
+                    size=sell_qty,
+                    reduce_only=False,
+                )
+                if sold < sell_qty:
+                    raise RuntimeError(f"Opposite short open partial after retries: {sold}/{sell_qty}")
+
+            elif remaining_call is not None and remaining_put is None:
+                base_leg = remaining_call
+                opposite_symbol = base_leg.symbol
+                if opposite_symbol.startswith("P-"):
+                    opposite_symbol = "C-" + opposite_symbol[2:]
+                elif opposite_symbol.startswith("C-"):
+                    opposite_symbol = "P-" + opposite_symbol[2:]
+                direct = await self.exchange.get_product_by_symbol(opposite_symbol)
+                if not isinstance(direct, dict):
+                    raise RuntimeError("Could not find opposite option contract for strangle->straddle conversion")
+                opposite_product_id = int(direct["id"])
+                sell_qty = abs(base_leg.size)
+                sold = await self.executor.execute_market_single_submission_with_fill_confirmation(
+                    product_id=opposite_product_id,
+                    side="sell",
+                    size=sell_qty,
+                    reduce_only=False,
+                )
+                if sold < sell_qty:
+                    raise RuntimeError(f"Opposite short open partial after retries: {sold}/{sell_qty}")
+
+            else:
+                # Nothing to convert (both legs missing or both present) — bail out
+                raise RuntimeError("Unexpected position state during strangle->straddle conversion")
+
+            # Small delay for positions to settle
+            await asyncio.sleep(0.5)
+
+            # Now detect the short straddle and convert to iron fly using existing helper
+            try:
+                straddle = await self.positions.detect_short_straddle()
+            except Exception as exc:
+                raise RuntimeError(f"Failed to detect short straddle after conversion: {exc}") from exc
+
+            straddle_be = self.positions.compute_straddle_breakevens(straddle)
+            wing_put_strike, wing_call_strike = await self._convert_short_straddle_to_iron_fly(
+                straddle, straddle_be
+            )
+            # Finalize iron fly breakevens (positions monitoring loop will pick this up)
+            return (wing_put_strike, wing_call_strike)
+
     async def run(self) -> None:
-        ratio = None
+        strangle = None
         wait_cycles = 0
-        ratio_scan_task = None
+        strangle_scan_task = None
 
         try:
             while True:
-                if ratio is None:
+                if strangle is None:
                     self._set_strategy_state(
-                        action="waiting for ratio spread",
-                        status="no ratio spread found",
-                        status_message="no ratio spread found",
+                        action="waiting for short strangle",
+                        status="no short strangle found",
+                        status_message="no short strangle found",
                         trigger_price=None,
                         trigger_pnl=None,
                     )
 
-                    if ratio_scan_task is None:
-                        ratio_scan_task = asyncio.create_task(self.positions.detect_ratio_spread())
+                    if strangle_scan_task is None:
+                        strangle_scan_task = asyncio.create_task(self.positions.detect_short_strangle())
 
-                    if ratio_scan_task.done():
+                    if strangle_scan_task.done():
                         try:
-                            ratio = ratio_scan_task.result()
-                            ratio_scan_task = None
+                            strangle = strangle_scan_task.result()
+                            strangle_scan_task = None
                             self._set_strategy_state(
-                                action="monitoring ratio-spread",
+                                action="monitoring short-strangle",
                                 status="waiting for trigger",
-                                status_message="ratio spread detected",
-                                trigger_price=ratio.short_leg.strike,
+                                status_message="short strangle detected",
+                                trigger_price=(f"put-{strangle.put_leg.strike},call-{strangle.call_leg.strike}"),
                                 trigger_pnl=None,
                             )
                             LOGGER.info(
-                                "Detected initial ratio spread long=%s %s@%s short=%s %s@%s",
-                                ratio.long_leg.option_type,
-                                abs(ratio.long_leg.size),
-                                ratio.long_leg.strike,
-                                ratio.short_leg.option_type,
-                                abs(ratio.short_leg.size),
-                                ratio.short_leg.strike,
+                                "Detected initial short strangle put=%s@%s call=%s@%s",
+                                strangle.put_leg.symbol,
+                                strangle.put_leg.strike,
+                                strangle.call_leg.symbol,
+                                strangle.call_leg.strike,
                             )
                         except Exception as exc:
-                            ratio_scan_task = None
+                            strangle_scan_task = None
                             wait_cycles += 1
                             try:
                                 index_price = await self.exchange.get_index_price("BTCUSDT")
                                 self.state.last_index_price = index_price
                                 LOGGER.info(
-                                    "no ratio spread found | BTC index=%.2f | attempt=%s | detail=%s",
+                                    "no short strangle found | BTC index=%.2f | attempt=%s | detail=%s",
                                     index_price,
                                     wait_cycles,
                                     str(exc),
                                 )
                             except Exception:
                                 LOGGER.info(
-                                    "no ratio spread found | BTC index=unavailable | attempt=%s | detail=%s",
+                                    "no short strangle found | BTC index=unavailable | attempt=%s | detail=%s",
                                     wait_cycles,
                                     str(exc),
                                 )
@@ -342,37 +324,36 @@ class StrategyEngine:
                             index_price = await self.exchange.get_index_price("BTCUSDT")
                             self.state.last_index_price = index_price
                             LOGGER.info(
-                                "no ratio spread found | BTC index=%.2f | attempt=%s | detail=position scan in progress",
+                                "no short strangle found | BTC index=%.2f | attempt=%s | detail=position scan in progress",
                                 index_price,
                                 wait_cycles,
                             )
                         except Exception:
                             LOGGER.info(
-                                "no ratio spread found | BTC index=unavailable | attempt=%s | detail=position scan in progress",
+                                "no short strangle found | BTC index=unavailable | attempt=%s | detail=position scan in progress",
                                 wait_cycles,
                             )
                         await asyncio.sleep(self.settings.poll_interval_seconds)
                         continue
 
                 self._set_strategy_state(
-                    action="monitoring ratio-spread",
+                    action="monitoring short-strangle",
                     status="waiting for trigger",
                     status_message="monitoring index and unrealized pnl",
-                    trigger_price=ratio.short_leg.strike,
+                    trigger_price=(f"put-{strangle.put_leg.strike},call-{strangle.call_leg.strike}"),
                     trigger_pnl=None,
                 )
 
-                # Re-verify that the ratio spread still exists on the exchange.
-                # If positions were closed externally, reset ratio and loop back.
+                # Re-verify that the strangle still exists on the exchange.
                 try:
-                    await self.positions.detect_ratio_spread()
+                    await self.positions.detect_short_strangle()
                 except Exception:
-                    LOGGER.info("no ratio spread found | positions closed externally, resetting monitor")
-                    ratio = None
+                    LOGGER.info("no short strangle found | positions closed externally, resetting monitor")
+                    strangle = None
                     self._set_strategy_state(
-                        action="waiting for ratio spread",
-                        status="no ratio spread found",
-                        status_message="no ratio spread found",
+                        action="waiting for short strangle",
+                        status="no short strangle found",
+                        status_message="no short strangle found",
                         trigger_price=None,
                         trigger_pnl=None,
                     )
@@ -380,102 +361,133 @@ class StrategyEngine:
                     continue
 
                 index_price = await self.exchange.get_index_price("BTCUSDT")
-                pnl = await self.positions.compute_unrealized_pnl(ratio)
-                long_q = await self.exchange.get_best_quote(ratio.long_leg.product_id)
-                short_q = await self.exchange.get_best_quote(ratio.short_leg.product_id)
+                pnl = await self.positions.compute_straddle_pnl(strangle)
+                put_q = await self.exchange.get_best_quote(strangle.put_leg.product_id)
+                call_q = await self.exchange.get_best_quote(strangle.call_leg.product_id)
                 LOGGER.info(
-                    "Live monitor index=%.2f strike=%.2f unrealized_pnl=%.4f",
+                    "Live monitor index=%.2f put_strike=%.2f call_strike=%.2f unrealized_pnl=%.4f",
                     index_price,
-                    ratio.short_leg.strike,
+                    strangle.put_leg.strike,
+                    strangle.call_leg.strike,
                     pnl,
                 )
                 leg_snapshot = {
-                    "event": "ratio_monitor_snapshot",
+                    "event": "strangle_monitor_snapshot",
                     "index_price": round(index_price, 4),
                     "unrealized_pnl": round(pnl, 8),
-                    "long_leg": {
-                        "symbol": ratio.long_leg.symbol,
-                        "type": ratio.long_leg.option_type,
-                        "strike": ratio.long_leg.strike,
-                        "quantity": abs(ratio.long_leg.size),
-                        "entry_price": ratio.long_leg.entry_price,
-                        "best_bid": long_q.best_bid,
-                        "best_ask": long_q.best_ask,
+                    "put_leg": {
+                        "symbol": strangle.put_leg.symbol,
+                        "type": strangle.put_leg.option_type,
+                        "strike": strangle.put_leg.strike,
+                        "quantity": abs(strangle.put_leg.size),
+                        "entry_price": strangle.put_leg.entry_price,
+                        "best_bid": put_q.best_bid,
+                        "best_ask": put_q.best_ask,
                     },
-                    "short_leg": {
-                        "symbol": ratio.short_leg.symbol,
-                        "type": ratio.short_leg.option_type,
-                        "strike": ratio.short_leg.strike,
-                        "quantity": abs(ratio.short_leg.size),
-                        "entry_price": ratio.short_leg.entry_price,
-                        "best_bid": short_q.best_bid,
-                        "best_ask": short_q.best_ask,
+                    "call_leg": {
+                        "symbol": strangle.call_leg.symbol,
+                        "type": strangle.call_leg.option_type,
+                        "strike": strangle.call_leg.strike,
+                        "quantity": abs(strangle.call_leg.size),
+                        "entry_price": strangle.call_leg.entry_price,
+                        "best_bid": call_q.best_bid,
+                        "best_ask": call_q.best_ask,
                     },
                 }
                 LOGGER.info("Snapshot: %s", json.dumps(leg_snapshot, separators=(",", ":")))
 
-                triggered_now = self._crossed_or_touched(
+                triggered_put = self._crossed_or_touched(
                     self.state.last_index_price,
                     index_price,
-                    ratio.short_leg.strike,
-                    ratio.short_leg.option_type,
+                    strangle.put_leg.strike,
+                    "put",
+                )
+                triggered_call = self._crossed_or_touched(
+                    self.state.last_index_price,
+                    index_price,
+                    strangle.call_leg.strike,
+                    "call",
                 )
                 self.state.last_index_price = index_price
 
+                triggered_now = triggered_put or triggered_call
+
                 if not self.state.triggered and triggered_now:
                     self.state.triggered = True
+                    # position quantity reference (use smaller side if mismatch)
+                    position_qty = min(abs(strangle.put_leg.size), abs(strangle.call_leg.size))
+                    pnl_threshold = position_qty * 0.5
                     self._set_strategy_state(
-                        action="closing whole position" if pnl >= abs(ratio.short_leg_each_qty)*0.1 else "converting ratio spread to short straddle",
-                        status="waiting for closing positions" if pnl >= abs(ratio.short_leg_each_qty)*0.1 else "waiting for conversion",
+                        action="closing whole position" if pnl >= pnl_threshold else "adjusting short strangle",
+                        status="waiting for closing positions" if pnl >= pnl_threshold else "waiting for adjustment",
                         status_message="trigger hit, evaluating pnl decision",
                         trigger_price=None,
                         trigger_pnl=None,
                     )
-                    LOGGER.info("Trigger hit at index=%.2f strike=%.2f", index_price, ratio.short_leg.strike)
+                    LOGGER.info("Trigger hit at index=%.2f put=%s call=%s", index_price, strangle.put_leg.strike, strangle.call_leg.strike)
 
-                    if pnl >= abs(ratio.short_leg_each_qty)*0.1:
+                    if pnl >= pnl_threshold:
                         self._set_status("closing all positions and exiting")
                         LOGGER.info(
                             "PnL %.4f >= threshold %.2f; closing all positions and exiting",
                             pnl,
-                            abs(ratio.short_leg_each_qty)*0.1,
+                            pnl_threshold,
                         )
-                        await self._close_entire_ratio(ratio)
+                        await self._close_all_open_option_positions()
                         return
 
-                    self._set_strategy_state(
-                        action="converting ratio spread to short straddle",
-                        status="waiting for conversion",
-                        status_message="converting ratio spread to short straddle",
-                        trigger_price=None,
-                        trigger_pnl=None,
-                    )
-                    LOGGER.info(
-                        "PnL %.4f < threshold %.2f; converting to short straddle",
-                        pnl,
-                        abs(ratio.short_leg_each_qty)*0.1,
-                    )
+                    # Determine which strike was breached. If both, fallback to closing all.
+                    if triggered_put and not triggered_call:
+                        breached = "put"
+                    elif triggered_call and not triggered_put:
+                        breached = "call"
+                    else:
+                        # both breached -> emergency close
+                        LOGGER.info("Both strikes breached simultaneously; flattening positions")
+                        await self._close_all_open_option_positions()
+                        return
 
+                    # Square off the opposite short leg
                     try:
-                        await self._convert_to_short_straddle(ratio)
+                        if breached == "put":
+                            # buy back the short call
+                            await self.executor.execute_market_single_submission_with_fill_confirmation(
+                                product_id=strangle.call_leg.product_id,
+                                side="buy",
+                                size=abs(strangle.call_leg.size),
+                                reduce_only=True,
+                            )
+                        else:
+                            # buy back the short put
+                            await self.executor.execute_market_single_submission_with_fill_confirmation(
+                                product_id=strangle.put_leg.product_id,
+                                side="buy",
+                                size=abs(strangle.put_leg.size),
+                                reduce_only=True,
+                            )
                     except Exception:
-                        self._set_status("adjustment failed, emergency flatten")
-                        LOGGER.exception(
-                            "Adjustment failed. Emergency flattening remaining initial ratio legs."
-                        )
-                        await self._close_entire_ratio(ratio)
-                        ratio = None
+                        LOGGER.exception("Failed to square off opposite short during adjustment; attempting emergency flatten")
+                        await self._close_all_open_option_positions()
+                        return
+
+                    # Convert remaining short into short straddle and then to iron fly
+                    try:
+                        wing_put_strike, wing_call_strike = await self._convert_strangle_to_straddle_and_iron_fly(strangle)
+                    except Exception:
+                        LOGGER.exception("Adjustment failed. Emergency flattening remaining legs.")
+                        await self._close_all_open_option_positions()
+                        strangle = None
                         self._set_strategy_state(
-                            action="waiting for ratio spread",
-                            status="no ratio spread found",
-                            status_message="no ratio spread found",
+                            action="waiting for short strangle",
+                            status="no short strangle found",
+                            status_message="no short strangle found",
                             trigger_price=None,
                             trigger_pnl=None,
                         )
                         await asyncio.sleep(self.settings.poll_interval_seconds)
                         continue
 
-                    # Conversion succeeded — switch to straddle monitoring mode.
+                    # Conversion succeeded — enter iron fly monitoring (reuse existing block)
                     self._set_strategy_state(
                         action="converting short straddle to iron fly",
                         status="waiting for conversion",
@@ -485,8 +497,6 @@ class StrategyEngine:
                     )
                     straddle = None
                     breakevens_logged = False
-                    wing_put_strike = None
-                    wing_call_strike = None
                     iron_fly_be = None
                     while True:
                         try:
@@ -498,13 +508,8 @@ class StrategyEngine:
                             self._set_status("straddle closed")
                             return
 
-                        straddle_be = self.positions.compute_straddle_breakevens(straddle)
-                        if wing_put_strike is None or wing_call_strike is None:
-                            wing_put_strike, wing_call_strike = await self._convert_short_straddle_to_iron_fly(
-                                straddle,
-                                straddle_be,
-                            )
-                            # Now compute iron fly breakevens
+                        if iron_fly_be is None:
+                            # compute iron fly breakevens
                             iron_fly_be = await self.positions.compute_iron_fly_breakevens(
                                 straddle, wing_put_strike, wing_call_strike
                             )
@@ -520,8 +525,7 @@ class StrategyEngine:
                                 ),
                                 trigger_pnl=pnl_threshold,
                             )
-                            
-                            # Log iron fly breakevens immediately after creation
+
                             LOGGER.info(
                                 "Iron fly created! Breakevens: strike=%.2f net_premium=%.6f lower=%.2f upper=%.2f wing_put=%.2f wing_call=%.2f",
                                 iron_fly_be.strike,
@@ -667,7 +671,7 @@ class StrategyEngine:
 
                 await asyncio.sleep(self.settings.poll_interval_seconds)
         finally:
-            if ratio_scan_task is not None and not ratio_scan_task.done():
-                ratio_scan_task.cancel()
+            if strangle_scan_task is not None and not strangle_scan_task.done():
+                strangle_scan_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
-                    await ratio_scan_task
+                    await strangle_scan_task

@@ -4,15 +4,13 @@ import logging
 from typing import Any, Dict
 
 from src.exchange_client import DeltaExchangeClient
-from src.risk_manager import RiskManager
 
 LOGGER = logging.getLogger(__name__)
 
 
 class OrderExecutor:
-    def __init__(self, exchange: DeltaExchangeClient, risk: RiskManager) -> None:
+    def __init__(self, exchange: DeltaExchangeClient) -> None:
         self.exchange = exchange
-        self.risk = risk
 
     @staticmethod
     def _extract_order_id(place_resp: Dict[str, Any]) -> str:

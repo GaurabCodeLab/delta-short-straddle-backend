@@ -15,7 +15,6 @@ from src.exchange_client import DeltaExchangeClient
 from src.logging_config import setup_logging
 from src.order_executor import OrderExecutor
 from src.position_manager import PositionManager
-from src.risk_manager import RiskManager
 from src.strategy_engine import StrategyEngine
 
 
@@ -182,12 +181,8 @@ def build_strategy() -> StrategyEngine:
         ssl_verify=settings.ssl_verify,
     )
     positions = PositionManager(exchange)
-    risk = RiskManager(
-        max_single_order_qty=settings.max_single_order_qty,
-        max_total_option_notional=settings.max_total_option_notional,
-    )
-    executor = OrderExecutor(exchange, risk)
-    return StrategyEngine(exchange, positions, executor, risk, settings)
+    executor = OrderExecutor(exchange)
+    return StrategyEngine(exchange, positions, executor, settings)
 
 
 app = FastAPI(title="Delta BTC Options API")
