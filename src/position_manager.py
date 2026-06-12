@@ -166,7 +166,7 @@ class PositionManager:
         )
         raise RuntimeError("No short straddle (short put + short call same strike) found. Legs: " + leg_summary)
 
-    async def detect_short_strangle(self) -> ShortStrangle:
+    async def detect_short_strangle(self, require_otm: bool = True) -> ShortStrangle:
         legs = await self.exchange.parse_option_positions()
         if not legs:
             raise RuntimeError("No open option positions found")
@@ -175,7 +175,7 @@ class PositionManager:
         puts = [x for x in shorts if x.option_type == "put"]
         calls = [x for x in shorts if x.option_type == "call"]
 
-        # Need current index price to determine OTM status
+        # Need current index price to determine OTM status only when requested
         try:
             index_price = await self.exchange.get_index_price("BTCUSDT")
         except Exception:
@@ -187,8 +187,7 @@ class PositionManager:
                 if not same_expiry:
                     continue
 
-                # If index price available, ensure both legs are OTM relative to index
-                if index_price is not None:
+                if require_otm and index_price is not None:
                     is_put_otm = put_leg.strike < index_price
                     is_call_otm = call_leg.strike > index_price
                     if not (is_put_otm and is_call_otm):

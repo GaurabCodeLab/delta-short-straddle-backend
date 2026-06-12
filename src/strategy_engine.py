@@ -346,7 +346,7 @@ class StrategyEngine:
 
                 # Re-verify that the strangle still exists on the exchange.
                 try:
-                    await self.positions.detect_short_strangle()
+                    await self.positions.detect_short_strangle(require_otm=False)
                 except Exception:
                     LOGGER.info("no short strangle found | positions closed externally, resetting monitor")
                     strangle = None
