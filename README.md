@@ -73,6 +73,7 @@ python -m src.main
 - `POLL_INTERVAL_SECONDS` (default: `2`)
 - `MAX_SINGLE_ORDER_QTY` (default: `10`)
 - `MAX_TOTAL_OPTION_NOTIONAL` (default: `100000`)
+- `PROFIT_CAPTURE_RATIO` (default: `0.5` for 50% of total premium received)
 
 Heartbeat logs run on the same interval as `POLL_INTERVAL_SECONDS`.
 

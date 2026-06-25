@@ -263,6 +263,16 @@ class PositionManager:
             upper_breakeven=upper_breakeven,
         )
 
+    def compute_total_premium_received(self, straddle: ShortStraddle) -> float:
+        put_exposure = abs(straddle.put_leg.size) * straddle.put_leg.contract_value
+        call_exposure = abs(straddle.call_leg.size) * straddle.call_leg.contract_value
+        if put_exposure <= 0 or call_exposure <= 0:
+            raise RuntimeError("Invalid straddle exposure while calculating total premium received")
+
+        return (put_exposure * straddle.put_leg.entry_price) + (
+            call_exposure * straddle.call_leg.entry_price
+        )
+
     async def compute_iron_fly_breakevens(
         self,
         straddle: ShortStraddle,

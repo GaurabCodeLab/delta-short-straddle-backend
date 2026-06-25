@@ -362,19 +362,45 @@ class StrategyEngine:
 
                 index_price = await self.exchange.get_index_price("BTCUSDT")
                 pnl = await self.positions.compute_straddle_pnl(strangle)
+                total_premium_received = self.positions.compute_total_premium_received(strangle)
+                profit_threshold = total_premium_received * self.settings.profit_capture_ratio
                 put_q = await self.exchange.get_best_quote(strangle.put_leg.product_id)
                 call_q = await self.exchange.get_best_quote(strangle.call_leg.product_id)
                 LOGGER.info(
-                    "Live monitor index=%.2f put_strike=%.2f call_strike=%.2f unrealized_pnl=%.4f",
+                    "Live monitor index=%.2f put_strike=%.2f call_strike=%.2f unrealized_pnl=%.4f premium_received=%.4f threshold=%.4f ratio=%.2f",
                     index_price,
                     strangle.put_leg.strike,
                     strangle.call_leg.strike,
                     pnl,
+                    total_premium_received,
+                    profit_threshold,
+                    self.settings.profit_capture_ratio,
                 )
+                if pnl >= profit_threshold:
+                    self._set_strategy_state(
+                        action="closing whole position",
+                        status="profit target reached",
+                        status_message=(
+                            f"profit target reached: pnl={pnl:.4f}, "
+                            f"threshold={profit_threshold:.4f}"
+                        ),
+                        trigger_price=None,
+                        trigger_pnl=pnl,
+                    )
+                    LOGGER.info(
+                        "Profit capture condition met: pnl %.4f >= %.1f%% premium threshold %.4f; closing all positions",
+                        pnl,
+                        self.settings.profit_capture_ratio * 100,
+                        profit_threshold,
+                    )
+                    await self._close_all_open_option_positions()
+                    return
                 leg_snapshot = {
                     "event": "strangle_monitor_snapshot",
                     "index_price": round(index_price, 4),
                     "unrealized_pnl": round(pnl, 8),
+                    "total_premium_received": round(total_premium_received, 8),
+                    "profit_threshold": round(profit_threshold, 8),
                     "put_leg": {
                         "symbol": strangle.put_leg.symbol,
                         "type": strangle.put_leg.option_type,
@@ -414,22 +440,28 @@ class StrategyEngine:
 
                 if not self.state.triggered and triggered_now:
                     self.state.triggered = True
-                    # position quantity reference (use smaller side if mismatch)
-                    position_qty = min(abs(strangle.put_leg.size), abs(strangle.call_leg.size))
-                    pnl_threshold = position_qty * 0.5
+                    total_premium_received = self.positions.compute_total_premium_received(strangle)
+                    pnl_threshold = total_premium_received * self.settings.profit_capture_ratio
                     self._set_strategy_state(
                         action="closing whole position" if pnl >= pnl_threshold else "adjusting short strangle",
                         status="waiting for closing positions" if pnl >= pnl_threshold else "waiting for adjustment",
                         status_message="trigger hit, evaluating pnl decision",
                         trigger_price=None,
-                        trigger_pnl=None,
+                        trigger_pnl=pnl,
                     )
-                    LOGGER.info("Trigger hit at index=%.2f put=%s call=%s", index_price, strangle.put_leg.strike, strangle.call_leg.strike)
+                    LOGGER.info(
+                        "Trigger hit at index=%.2f put=%s call=%s premium_received=%.4f threshold=%.4f",
+                        index_price,
+                        strangle.put_leg.strike,
+                        strangle.call_leg.strike,
+                        total_premium_received,
+                        pnl_threshold,
+                    )
 
                     if pnl >= pnl_threshold:
                         self._set_status("closing all positions and exiting")
                         LOGGER.info(
-                            "PnL %.4f >= threshold %.2f; closing all positions and exiting",
+                            "PnL %.4f >= 50%% premium threshold %.4f; closing all positions and exiting",
                             pnl,
                             pnl_threshold,
                         )
