@@ -18,6 +18,7 @@ class Settings:
     max_single_order_qty: float
     max_total_option_notional: float
     profit_capture_ratio: float
+    leg_exit_buffer: float
     log_level: str
     ssl_verify: bool
 
@@ -36,6 +37,7 @@ def load_settings() -> Settings:
         max_single_order_qty=float(os.getenv("MAX_SINGLE_ORDER_QTY", "100")),
         max_total_option_notional=float(os.getenv("MAX_TOTAL_OPTION_NOTIONAL", "100000")),
         profit_capture_ratio=float(os.getenv("PROFIT_CAPTURE_RATIO", "0.5")),
+        leg_exit_buffer=float(os.getenv("LEG_EXIT_BUFFER", "10")),
         log_level=os.getenv("LOG_LEVEL", "INFO"),
         ssl_verify=os.getenv("DELTA_SSL_VERIFY", "false").strip().lower() in {"1", "true", "yes", "y"},
     )

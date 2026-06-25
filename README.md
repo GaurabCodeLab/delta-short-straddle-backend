@@ -74,6 +74,7 @@ python -m src.main
 - `MAX_SINGLE_ORDER_QTY` (default: `10`)
 - `MAX_TOTAL_OPTION_NOTIONAL` (default: `100000`)
 - `PROFIT_CAPTURE_RATIO` (default: `0.5` for 50% of total premium received)
+- `LEG_EXIT_BUFFER` (default: `10` — added to total premium to form leg-wise exit threshold)
 
 Heartbeat logs run on the same interval as `POLL_INTERVAL_SECONDS`.
 

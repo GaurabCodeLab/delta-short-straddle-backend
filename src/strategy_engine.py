@@ -265,6 +265,7 @@ class StrategyEngine:
         strangle = None
         wait_cycles = 0
         strangle_scan_task = None
+        total_premium_at_entry: float | None = None
 
         try:
             while True:
@@ -283,6 +284,12 @@ class StrategyEngine:
                     if strangle_scan_task.done():
                         try:
                             strangle = strangle_scan_task.result()
+                            # Capture the total premium at detection time so leg-wise
+                            # thresholds remain stable even if one leg is later closed.
+                            try:
+                                total_premium_at_entry = self.positions.compute_total_premium_received(strangle)
+                            except Exception:
+                                total_premium_at_entry = None
                             strangle_scan_task = None
                             self._set_strategy_state(
                                 action="monitoring short-strangle",
@@ -361,11 +368,51 @@ class StrategyEngine:
                     continue
 
                 index_price = await self.exchange.get_index_price("BTCUSDT")
-                pnl = await self.positions.compute_straddle_pnl(strangle)
-                total_premium_received = self.positions.compute_total_premium_received(strangle)
+
+                # Determine which legs are currently open (live state)
+                remaining_put = await self.positions.find_open_option_leg(
+                    option_type="put",
+                    strike=strangle.put_leg.strike,
+                    expiry=strangle.put_leg.expiry,
+                    side="short",
+                )
+                remaining_call = await self.positions.find_open_option_leg(
+                    option_type="call",
+                    strike=strangle.call_leg.strike,
+                    expiry=strangle.call_leg.expiry,
+                    side="short",
+                )
+
+                put_q = None
+                call_q = None
+                if remaining_put is not None:
+                    put_q = await self.exchange.get_best_quote(remaining_put.product_id)
+                if remaining_call is not None:
+                    call_q = await self.exchange.get_best_quote(remaining_call.product_id)
+
+                # Compute PnL for current live legs
+                if remaining_put is not None and remaining_call is not None:
+                    from src.models import ShortStraddle
+
+                    live_straddle = ShortStraddle(put_leg=remaining_put, call_leg=remaining_call)
+                    pnl = await self.positions.compute_straddle_pnl(live_straddle)
+                else:
+                    pnl = 0.0
+                    if remaining_put is not None and put_q is not None:
+                        put_qty = abs(remaining_put.size)
+                        pnl += put_qty * remaining_put.contract_value * (remaining_put.entry_price - put_q.best_ask)
+                    if remaining_call is not None and call_q is not None:
+                        call_qty = abs(remaining_call.size)
+                        pnl += call_qty * remaining_call.contract_value * (remaining_call.entry_price - call_q.best_ask)
+
+                # Use captured entry premium if available to keep thresholds stable
+                total_premium_received = (
+                    total_premium_at_entry
+                    if total_premium_at_entry is not None
+                    else self.positions.compute_total_premium_received(strangle)
+                )
                 profit_threshold = total_premium_received * self.settings.profit_capture_ratio
-                put_q = await self.exchange.get_best_quote(strangle.put_leg.product_id)
-                call_q = await self.exchange.get_best_quote(strangle.call_leg.product_id)
+
                 LOGGER.info(
                     "Live monitor index=%.2f put_strike=%.2f call_strike=%.2f unrealized_pnl=%.4f premium_received=%.4f threshold=%.4f ratio=%.2f",
                     index_price,
@@ -376,6 +423,7 @@ class StrategyEngine:
                     profit_threshold,
                     self.settings.profit_capture_ratio,
                 )
+
                 if pnl >= profit_threshold:
                     self._set_strategy_state(
                         action="closing whole position",
@@ -421,6 +469,82 @@ class StrategyEngine:
                     },
                 }
                 LOGGER.info("Snapshot: %s", json.dumps(leg_snapshot, separators=(",", ":")))
+
+                # Leg-wise stop condition: threshold = total premium received + configurable buffer
+                try:
+                    leg_exit_threshold = total_premium_received + float(self.settings.leg_exit_buffer)
+                    async with self._adjustment_lock:
+                        cur_put = await self.positions.find_open_option_leg(
+                            option_type="put",
+                            strike=strangle.put_leg.strike,
+                            expiry=strangle.put_leg.expiry,
+                            side="short",
+                        )
+                        cur_call = await self.positions.find_open_option_leg(
+                            option_type="call",
+                            strike=strangle.call_leg.strike,
+                            expiry=strangle.call_leg.expiry,
+                            side="short",
+                        )
+
+                        if cur_put is not None and put_q is not None and put_q.best_ask >= leg_exit_threshold:
+                            qty = abs(cur_put.size)
+                            LOGGER.info(
+                                "Put leg ask %.4f >= leg-exit-threshold %.4f; exiting put leg pid=%s qty=%s",
+                                put_q.best_ask,
+                                leg_exit_threshold,
+                                cur_put.product_id,
+                                qty,
+                            )
+                            filled = await self.executor.execute_market_single_submission_with_fill_confirmation(
+                                product_id=cur_put.product_id,
+                                side="buy",
+                                size=qty,
+                                reduce_only=True,
+                            )
+                            if filled < qty:
+                                LOGGER.warning("Partial fill closing put leg: %s/%s", filled, qty)
+
+                        if cur_call is not None and call_q is not None and call_q.best_ask >= leg_exit_threshold:
+                            qty = abs(cur_call.size)
+                            LOGGER.info(
+                                "Call leg ask %.4f >= leg-exit-threshold %.4f; exiting call leg pid=%s qty=%s",
+                                call_q.best_ask,
+                                leg_exit_threshold,
+                                cur_call.product_id,
+                                qty,
+                            )
+                            filled = await self.executor.execute_market_single_submission_with_fill_confirmation(
+                                product_id=cur_call.product_id,
+                                side="buy",
+                                size=qty,
+                                reduce_only=True,
+                            )
+                            if filled < qty:
+                                LOGGER.warning("Partial fill closing call leg: %s/%s", filled, qty)
+
+                        # Check live state after attempting exits
+                        cur_put_after = await self.positions.find_open_option_leg(
+                            option_type="put",
+                            strike=strangle.put_leg.strike,
+                            expiry=strangle.put_leg.expiry,
+                            side="short",
+                        )
+                        cur_call_after = await self.positions.find_open_option_leg(
+                            option_type="call",
+                            strike=strangle.call_leg.strike,
+                            expiry=strangle.call_leg.expiry,
+                            side="short",
+                        )
+
+                        if cur_put_after is None and cur_call_after is None:
+                            LOGGER.info("Both legs closed via leg-wise stops or externally; resetting monitor")
+                            strangle = None
+                            total_premium_at_entry = None
+                            await asyncio.sleep(self.settings.poll_interval_seconds)
+                            continue
+                except Exception:
+                    LOGGER.exception("Error while processing leg-wise stop condition")
 
                 triggered_put = self._crossed_or_touched(
                     self.state.last_index_price,
