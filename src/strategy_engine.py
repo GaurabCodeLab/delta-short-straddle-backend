@@ -59,6 +59,16 @@ class StrategyEngine:
         self.state.trigger_price = trigger_price
         self.state.trigger_pnl = trigger_pnl
 
+    def _compute_profit_threshold(self, total_premium_received: float) -> float:
+        return total_premium_received * self.settings.profit_capture_ratio
+
+    def _compute_leg_exit_threshold(self, leg_premium_value: float) -> float:
+        return leg_premium_value + self.settings.leg_exit_buffer
+
+    @staticmethod
+    def _compute_leg_market_value(leg, quote) -> float:
+        return abs(leg.size) * leg.contract_value * quote.best_ask
+
     @staticmethod
     def _crossed_or_touched(
         prev_price: Optional[float],
@@ -355,17 +365,34 @@ class StrategyEngine:
                 try:
                     await self.positions.detect_short_strangle(require_otm=False)
                 except Exception:
-                    LOGGER.info("no short strangle found | positions closed externally, resetting monitor")
-                    strangle = None
-                    self._set_strategy_state(
-                        action="waiting for short strangle",
-                        status="no short strangle found",
-                        status_message="no short strangle found",
-                        trigger_price=None,
-                        trigger_pnl=None,
+                    remaining_put = await self.positions.find_open_option_leg(
+                        option_type="put",
+                        strike=strangle.put_leg.strike,
+                        expiry=strangle.put_leg.expiry,
+                        side="short",
                     )
-                    await asyncio.sleep(self.settings.poll_interval_seconds)
-                    continue
+                    remaining_call = await self.positions.find_open_option_leg(
+                        option_type="call",
+                        strike=strangle.call_leg.strike,
+                        expiry=strangle.call_leg.expiry,
+                        side="short",
+                    )
+                    if remaining_put is None and remaining_call is None:
+                        LOGGER.info("no short strangle found | positions closed externally, resetting monitor")
+                        strangle = None
+                        total_premium_at_entry = None
+                        self._set_strategy_state(
+                            action="waiting for short strangle",
+                            status="no short strangle found",
+                            status_message="no short strangle found",
+                            trigger_price=None,
+                            trigger_pnl=None,
+                        )
+                        await asyncio.sleep(self.settings.poll_interval_seconds)
+                        continue
+                    LOGGER.info(
+                        "Partial strangle state detected | monitoring remaining leg(s) after external position change"
+                    )
 
                 index_price = await self.exchange.get_index_price("BTCUSDT")
 
@@ -423,7 +450,6 @@ class StrategyEngine:
                     profit_threshold,
                     self.settings.profit_capture_ratio,
                 )
-
                 if pnl >= profit_threshold:
                     self._set_strategy_state(
                         action="closing whole position",
@@ -470,9 +496,8 @@ class StrategyEngine:
                 }
                 LOGGER.info("Snapshot: %s", json.dumps(leg_snapshot, separators=(",", ":")))
 
-                # Leg-wise stop condition: threshold = total premium received + configurable buffer
+                # Leg-wise stop condition uses the same size/contract-value scaling as PnL.
                 try:
-                    leg_exit_threshold = total_premium_received + float(self.settings.leg_exit_buffer)
                     async with self._adjustment_lock:
                         cur_put = await self.positions.find_open_option_leg(
                             option_type="put",
@@ -487,41 +512,51 @@ class StrategyEngine:
                             side="short",
                         )
 
-                        if cur_put is not None and put_q is not None and put_q.best_ask >= leg_exit_threshold:
-                            qty = abs(cur_put.size)
-                            LOGGER.info(
-                                "Put leg ask %.4f >= leg-exit-threshold %.4f; exiting put leg pid=%s qty=%s",
-                                put_q.best_ask,
-                                leg_exit_threshold,
-                                cur_put.product_id,
-                                qty,
+                        if cur_put is not None and put_q is not None:
+                            put_market_value = self._compute_leg_market_value(cur_put, put_q)
+                            put_exit_threshold = self._compute_leg_exit_threshold(
+                                abs(cur_put.size) * cur_put.contract_value * cur_put.entry_price
                             )
-                            filled = await self.executor.execute_market_single_submission_with_fill_confirmation(
-                                product_id=cur_put.product_id,
-                                side="buy",
-                                size=qty,
-                                reduce_only=True,
-                            )
-                            if filled < qty:
-                                LOGGER.warning("Partial fill closing put leg: %s/%s", filled, qty)
+                            if put_market_value >= put_exit_threshold:
+                                qty = abs(cur_put.size)
+                                LOGGER.info(
+                                    "Put leg market value %.4f >= leg-exit-threshold %.4f; exiting put leg pid=%s qty=%s",
+                                    put_market_value,
+                                    put_exit_threshold,
+                                    cur_put.product_id,
+                                    qty,
+                                )
+                                filled = await self.executor.execute_market_single_submission_with_fill_confirmation(
+                                    product_id=cur_put.product_id,
+                                    side="buy",
+                                    size=qty,
+                                    reduce_only=True,
+                                )
+                                if filled < qty:
+                                    LOGGER.warning("Partial fill closing put leg: %s/%s", filled, qty)
 
-                        if cur_call is not None and call_q is not None and call_q.best_ask >= leg_exit_threshold:
-                            qty = abs(cur_call.size)
-                            LOGGER.info(
-                                "Call leg ask %.4f >= leg-exit-threshold %.4f; exiting call leg pid=%s qty=%s",
-                                call_q.best_ask,
-                                leg_exit_threshold,
-                                cur_call.product_id,
-                                qty,
+                        if cur_call is not None and call_q is not None:
+                            call_market_value = self._compute_leg_market_value(cur_call, call_q)
+                            call_exit_threshold = self._compute_leg_exit_threshold(
+                                abs(cur_call.size) * cur_call.contract_value * cur_call.entry_price
                             )
-                            filled = await self.executor.execute_market_single_submission_with_fill_confirmation(
-                                product_id=cur_call.product_id,
-                                side="buy",
-                                size=qty,
-                                reduce_only=True,
-                            )
-                            if filled < qty:
-                                LOGGER.warning("Partial fill closing call leg: %s/%s", filled, qty)
+                            if call_market_value >= call_exit_threshold:
+                                qty = abs(cur_call.size)
+                                LOGGER.info(
+                                    "Call leg market value %.4f >= leg-exit-threshold %.4f; exiting call leg pid=%s qty=%s",
+                                    call_market_value,
+                                    call_exit_threshold,
+                                    cur_call.product_id,
+                                    qty,
+                                )
+                                filled = await self.executor.execute_market_single_submission_with_fill_confirmation(
+                                    product_id=cur_call.product_id,
+                                    side="buy",
+                                    size=qty,
+                                    reduce_only=True,
+                                )
+                                if filled < qty:
+                                    LOGGER.warning("Partial fill closing call leg: %s/%s", filled, qty)
 
                         # Check live state after attempting exits
                         cur_put_after = await self.positions.find_open_option_leg(

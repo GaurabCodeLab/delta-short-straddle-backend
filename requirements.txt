@@ -5,3 +5,5 @@ python-dotenv
 requests
 fastapi>=0.110.0
 uvicorn>=0.24.0
+pytest
+pytest-asyncio
