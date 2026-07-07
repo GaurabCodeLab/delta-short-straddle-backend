@@ -63,7 +63,7 @@ class StrategyEngine:
         return total_premium_received * self.settings.profit_capture_ratio
 
     def _compute_leg_exit_threshold(self, leg_premium_value: float) -> float:
-        return leg_premium_value + self.settings.leg_exit_buffer
+        return (leg_premium_value*2) + self.settings.leg_exit_buffer
 
     @staticmethod
     def _compute_leg_market_value(leg, quote) -> float:
