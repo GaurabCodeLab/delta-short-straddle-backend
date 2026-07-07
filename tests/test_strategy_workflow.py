@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 
 import pytest
+import requests
 
 from src.config import Settings
 from src.exchange_client import DeltaExchangeClient, ExchangeClientError
@@ -100,6 +101,29 @@ def settings():
         log_level="INFO",
         ssl_verify=False,
     )
+
+
+def test_apply_clock_skew_from_error_updates_offset():
+    client = DeltaExchangeClient(
+        api_key="key",
+        api_secret="secret",
+        base_url="https://test",
+        ssl_verify=False,
+    )
+
+    response = requests.Response()
+    response.status_code = 401
+    response._content = (
+        b'{"success":false,"error":{"code":"expired_signature","context":'
+        b'{"request_time":1700000000,"server_time":1700000011}}}'
+    )
+    response.url = "https://example.test/v2/positions/margined"
+    response.reason = "Unauthorized"
+    exc = requests.HTTPError("401 HTTP Error: Unauthorized", response=response)
+
+    client._apply_clock_skew_from_error(exc)
+
+    assert client._clock_skew_offset == 11
 
 
 @pytest.mark.asyncio
