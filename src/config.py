@@ -18,6 +18,8 @@ class Settings:
     max_single_order_qty: float
     max_total_option_notional: float
     profit_capture_ratio: float
+    short_straddle_profit_capture_ratio: float
+    short_straddle_max_loss_ratio: float
     leg_exit_buffer: float
     log_level: str
     ssl_verify: bool
@@ -29,6 +31,7 @@ def load_settings() -> Settings:
     if not api_key or not api_secret:
         raise ValueError("Missing DELTA_API_KEY or DELTA_API_SECRET in environment.")
 
+    profit_capture_ratio = float(os.getenv("PROFIT_CAPTURE_RATIO", "0.5"))
     return Settings(
         api_key=api_key,
         api_secret=api_secret,
@@ -36,7 +39,9 @@ def load_settings() -> Settings:
         poll_interval_seconds=float(os.getenv("POLL_INTERVAL_SECONDS", "0.2")),
         max_single_order_qty=float(os.getenv("MAX_SINGLE_ORDER_QTY", "100")),
         max_total_option_notional=float(os.getenv("MAX_TOTAL_OPTION_NOTIONAL", "100000")),
-        profit_capture_ratio=float(os.getenv("PROFIT_CAPTURE_RATIO", "0.5")),
+        profit_capture_ratio=profit_capture_ratio,
+        short_straddle_profit_capture_ratio=float(os.getenv("SHORT_STRADDLE_PROFIT_CAPTURE_RATIO", str(profit_capture_ratio))),
+        short_straddle_max_loss_ratio=float(os.getenv("SHORT_STRADDLE_MAX_LOSS_RATIO", "1.0")),
         leg_exit_buffer=float(os.getenv("LEG_EXIT_BUFFER", "10")),
         log_level=os.getenv("LOG_LEVEL", "INFO"),
         ssl_verify=os.getenv("DELTA_SSL_VERIFY", "false").strip().lower() in {"1", "true", "yes", "y"},

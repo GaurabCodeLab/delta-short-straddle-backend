@@ -3,7 +3,9 @@
 Python async trading bot for Delta Exchange BTC options that:
 
 - Detects an existing short strangle automatically
-- Watches Delta BTC index price against both short strikes
+- Detects an active short straddle automatically
+- Watches Delta BTC index price against both option strikes
+- Continuously monitors combined short-straddle P&L and exits when profit or loss thresholds are reached
 - On first trigger, either exits all positions (`PnL >= 5 USD`) or converts to an iron fly via a short straddle adjustment (`PnL < 5 USD`)
 
 ## Key Features
@@ -62,6 +64,46 @@ copy .env.example .env
 
 ```bash
 python -m src.main
+```
+
+4. Run tests:
+
+```bash
+python -m pytest tests/test_strategy_workflow.py
+```
+
+## Testing
+
+Run the focused strategy workflow test file:
+
+```bash
+python -m pytest tests/test_strategy_workflow.py
+```
+
+Run the full test suite:
+
+```bash
+python -m pytest
+```
+
+Run tests with coverage reporting for the `src/` package:
+
+```bash
+python -m pytest --cov=src --cov-report=term-missing
+```
+
+Generate both terminal and HTML coverage reports:
+
+```bash
+python -m pytest --cov=src --cov-report=term-missing --cov-report=html
+```
+
+The HTML report is written to `htmlcov/index.html`.
+
+Run a single test case by name:
+
+```bash
+python -m pytest tests/test_strategy_workflow.py -k test_short_straddle_monitor_exits_on_profit_target
 ```
 
 ## Environment Variables

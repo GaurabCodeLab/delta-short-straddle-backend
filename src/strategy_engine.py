@@ -9,6 +9,7 @@ from typing import Optional
 
 from src.config import Settings
 from src.exchange_client import DeltaExchangeClient
+from src.models import ShortStraddle
 from src.order_executor import OrderExecutor
 from src.position_manager import PositionManager
 
@@ -40,6 +41,7 @@ class StrategyEngine:
         self.settings = settings
         self.state = StrategyState()
         self._adjustment_lock = asyncio.Lock()
+        self._exit_lock = asyncio.Lock()
 
     def _set_status(self, message: str) -> None:
         self.state.status_message = message
@@ -68,6 +70,229 @@ class StrategyEngine:
     @staticmethod
     def _compute_leg_market_value(leg, quote) -> float:
         return abs(leg.size) * leg.contract_value * quote.best_ask
+
+    async def _close_short_straddle(self, straddle: ShortStraddle) -> None:
+        async with self._exit_lock:
+            submitted_orders = []
+            for leg in (straddle.put_leg, straddle.call_leg):
+                observed_leg = await self.positions.find_open_option_leg(
+                    option_type=leg.option_type,
+                    strike=leg.strike,
+                    expiry=leg.expiry,
+                    side="short",
+                )
+                if observed_leg is None:
+                    LOGGER.info(
+                        "Short straddle leg already closed: %s %s %s",
+                        leg.option_type,
+                        leg.strike,
+                        leg.expiry,
+                    )
+                    continue
+
+                size = abs(observed_leg.size)
+                side = "buy" if observed_leg.size < 0 else "sell"
+                try:
+                    filled = await self.executor.execute_market_single_submission_with_fill_confirmation(
+                        product_id=observed_leg.product_id,
+                        side=side,
+                        size=size,
+                        reduce_only=True,
+                    )
+                except Exception:
+                    LOGGER.exception(
+                        "Failed to close short straddle leg %s %s",
+                        observed_leg.product_id,
+                        observed_leg.symbol,
+                    )
+                    raise
+
+                submitted_orders.append(
+                    {
+                        "product_id": observed_leg.product_id,
+                        "symbol": observed_leg.symbol,
+                        "side": side,
+                        "requested_size": size,
+                        "filled_size": filled,
+                    }
+                )
+                if filled < size:
+                    LOGGER.warning(
+                        "Partial close for short straddle leg %s: filled=%s requested=%s",
+                        observed_leg.product_id,
+                        filled,
+                        size,
+                    )
+
+            await asyncio.sleep(0.5)
+            remaining_put = await self.positions.find_open_option_leg(
+                option_type="put",
+                strike=straddle.put_leg.strike,
+                expiry=straddle.put_leg.expiry,
+                side="short",
+            )
+            remaining_call = await self.positions.find_open_option_leg(
+                option_type="call",
+                strike=straddle.call_leg.strike,
+                expiry=straddle.call_leg.expiry,
+                side="short",
+            )
+
+            LOGGER.info(
+                "Short straddle exit summary | strategy=short_straddle | submitted_orders=%s | remaining_put=%s | remaining_call=%s",
+                submitted_orders,
+                bool(remaining_put),
+                bool(remaining_call),
+            )
+
+            if remaining_put is not None or remaining_call is not None:
+                raise RuntimeError(
+                    "Short straddle exit failed to close all legs. Remaining positions detected."
+                )
+
+    async def _monitor_short_straddle(self, straddle: ShortStraddle) -> None:
+        total_premium_received = self.positions.compute_total_premium_received(straddle)
+        profit_threshold = total_premium_received * self.settings.short_straddle_profit_capture_ratio
+        loss_threshold = -total_premium_received * self.settings.short_straddle_max_loss_ratio
+        LOGGER.info(
+            "Monitoring short straddle | strike=%s expiry=%s profit_threshold=%.4f loss_threshold=%.4f",
+            straddle.put_leg.strike,
+            straddle.put_leg.expiry.date().isoformat(),
+            profit_threshold,
+            loss_threshold,
+        )
+
+        while True:
+            current_put = await self.positions.find_open_option_leg(
+                option_type="put",
+                strike=straddle.put_leg.strike,
+                expiry=straddle.put_leg.expiry,
+                side="short",
+            )
+            current_call = await self.positions.find_open_option_leg(
+                option_type="call",
+                strike=straddle.call_leg.strike,
+                expiry=straddle.call_leg.expiry,
+                side="short",
+            )
+
+            if current_put is None and current_call is None:
+                LOGGER.info(
+                    "Short straddle already closed before exit logic ran | strike=%s expiry=%s",
+                    straddle.put_leg.strike,
+                    straddle.put_leg.expiry.date().isoformat(),
+                )
+                return
+
+            if current_put is None or current_call is None:
+                LOGGER.info(
+                    "Short straddle partial state detected; closing remaining leg(s) | put_exists=%s call_exists=%s",
+                    current_put is not None,
+                    current_call is not None,
+                )
+                await self._close_short_straddle(straddle)
+                return
+
+            put_q = None
+            call_q = None
+            leg_details = {}
+            total_pnl = 0.0
+            missing_prices = []
+
+            if current_put is not None:
+                try:
+                    put_q = await self.exchange.get_best_quote(current_put.product_id)
+                    put_pnl = abs(current_put.size) * current_put.contract_value * (
+                        current_put.entry_price - put_q.best_ask
+                    )
+                    total_pnl += put_pnl
+                    leg_details["put"] = {
+                        "product_id": current_put.product_id,
+                        "symbol": current_put.symbol,
+                        "strike": current_put.strike,
+                        "entry_price": current_put.entry_price,
+                        "best_ask": put_q.best_ask,
+                        "pnl": round(put_pnl, 8),
+                    }
+                except Exception as exc:
+                    missing_prices.append(f"put:{current_put.product_id}")
+                    LOGGER.warning(
+                        "Missing put market price for short straddle monitoring %s: %s",
+                        current_put.product_id,
+                        str(exc),
+                    )
+
+            if current_call is not None:
+                try:
+                    call_q = await self.exchange.get_best_quote(current_call.product_id)
+                    call_pnl = abs(current_call.size) * current_call.contract_value * (
+                        current_call.entry_price - call_q.best_ask
+                    )
+                    total_pnl += call_pnl
+                    leg_details["call"] = {
+                        "product_id": current_call.product_id,
+                        "symbol": current_call.symbol,
+                        "strike": current_call.strike,
+                        "entry_price": current_call.entry_price,
+                        "best_ask": call_q.best_ask,
+                        "pnl": round(call_pnl, 8),
+                    }
+                except Exception as exc:
+                    missing_prices.append(f"call:{current_call.product_id}")
+                    LOGGER.warning(
+                        "Missing call market price for short straddle monitoring %s: %s",
+                        current_call.product_id,
+                        str(exc),
+                    )
+
+            if not leg_details:
+                LOGGER.warning(
+                    "No market prices available for short straddle legs, waiting before retry"
+                )
+                await asyncio.sleep(self.settings.poll_interval_seconds)
+                continue
+
+            self._set_strategy_state(
+                action="monitoring short straddle",
+                status="waiting for short straddle exit",
+                status_message=(
+                    f"short straddle monitoring pnl={total_pnl:.4f} "
+                    f"profit_threshold={profit_threshold:.4f} loss_threshold={loss_threshold:.4f}"
+                ),
+                trigger_price=None,
+                trigger_pnl=total_pnl,
+            )
+
+            LOGGER.info(
+                "Short straddle monitor | strike=%s expiry=%s pnl=%.4f profit_threshold=%.4f loss_threshold=%.4f missing_prices=%s leg_details=%s",
+                straddle.put_leg.strike,
+                straddle.put_leg.expiry.date().isoformat(),
+                total_pnl,
+                profit_threshold,
+                loss_threshold,
+                missing_prices,
+                leg_details,
+            )
+
+            if total_pnl >= profit_threshold:
+                LOGGER.info(
+                    "Short straddle exit triggered on profit target | pnl=%.4f threshold=%.4f",
+                    total_pnl,
+                    profit_threshold,
+                )
+                await self._close_short_straddle(straddle)
+                return
+
+            if total_pnl <= loss_threshold:
+                LOGGER.info(
+                    "Short straddle exit triggered on max loss | pnl=%.4f threshold=%.4f",
+                    total_pnl,
+                    loss_threshold,
+                )
+                await self._close_short_straddle(straddle)
+                return
+
+            await asyncio.sleep(self.settings.poll_interval_seconds)
 
     @staticmethod
     def _crossed_or_touched(
@@ -281,12 +506,22 @@ class StrategyEngine:
             while True:
                 if strangle is None:
                     self._set_strategy_state(
-                        action="waiting for short strangle",
-                        status="no short strangle found",
-                        status_message="no short strangle found",
+                        action="waiting for short straddle or short strangle",
+                        status="searching for positions",
+                        status_message="waiting for short straddle or short strangle",
                         trigger_price=None,
                         trigger_pnl=None,
                     )
+
+                    try:
+                        short_straddle = await self.positions.detect_short_straddle()
+                    except Exception as exc:
+                        short_straddle = None
+                        LOGGER.debug("Short straddle not found: %s", str(exc))
+
+                    if short_straddle is not None:
+                        await self._monitor_short_straddle(short_straddle)
+                        return
 
                     if strangle_scan_task is None:
                         strangle_scan_task = asyncio.create_task(self.positions.detect_short_strangle())

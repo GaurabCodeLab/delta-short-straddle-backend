@@ -214,7 +214,10 @@ class DeltaExchangeClient:
             best_bid = root.get("best_bid")
             best_ask = root.get("best_ask")
             if best_bid is not None and best_ask is not None:
-                return Quote(best_bid=float(best_bid), best_ask=float(best_ask))              
+                return Quote(best_bid=float(best_bid), best_ask=float(best_ask))
+            raise ExchangeClientError("Quote response missing best_bid or best_ask")
+        except ExchangeClientError:
+            raise
         except Exception as exc:
             error_msg = f"METHOD failed: {str(exc)}"
             LOGGER.debug(f"Quote fetch attempt for product {product_id}: {error_msg}")

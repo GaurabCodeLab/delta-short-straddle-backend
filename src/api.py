@@ -22,7 +22,7 @@ class JsonLogHandler(logging.Handler):
     def __init__(self, max_records: int = 1000) -> None:
         super().__init__(level=logging.INFO)
         self.records: deque[dict[str, Any]] = deque(maxlen=max_records)
-        self.lock = Lock()
+        self.records_lock = Lock()
         self.setFormatter(logging.Formatter("%(message)s"))
 
     def emit(self, record: logging.LogRecord) -> None:
@@ -51,11 +51,11 @@ class JsonLogHandler(logging.Handler):
             except Exception:
                 pass
 
-        with self.lock:
+        with self.records_lock:
             self.records.append(payload)
 
     def latest(self, limit: int | None = None) -> list[dict[str, Any]]:
-        with self.lock:
+        with self.records_lock:
             records = list(self.records)
         if limit is None:
             return records
