@@ -5,46 +5,37 @@ Python async trading bot for Delta Exchange BTC options that:
 - Detects an existing short strangle automatically
 - Detects an active short straddle automatically
 - Watches Delta BTC index price against both option strikes
-- Continuously monitors combined short-straddle P&L and exits when profit or loss thresholds are reached
-- On first trigger, either exits all positions (`PnL >= 5 USD`) or converts to an iron fly via a short straddle adjustment (`PnL < 5 USD`)
+- Continuously monitors combined short-straddle/strangle PnL and exits when profit or loss thresholds are reached
 
 ## Key Features
 
 - Modular architecture:
   - `exchange_client.py` (Delta API wrapper + retries)
   - `position_manager.py` (position discovery and live state)
-  - `strategy_engine.py` (trigger + adjustment logic)
-  - `risk_manager.py` (guards and notional limits)
+  - `strategy_engine.py` (trigger and dynamic adjustment logic)
   - `order_executor.py` (market order placement + fill confirmation)
-- Uses Delta index price (`BTCUSDT`) as the trigger reference
-- Handles partial fills via fill reconciliation loops
-- Retries transient API failures with exponential backoff
+- Uses Delta index price (`BTCUSDT`) for dynamic structure monitoring
+- Detects short straddle ↔ short strangle transitions and closes positions on exit conditions
 - Detailed structured logging
 
 ## Strategy Behavior
 
 ### 1) Initial Position Discovery
 
-The bot scans open option positions and identifies a valid short strangle where both legs are short, same expiry, and both legs are out-of-the-money relative to BTC index price.
+The bot scans open option positions and identifies a valid short strangle or short straddle with the same expiry.
 
-### 2) First Adjustment Trigger
+### 2) Dynamic Adjustment Trigger
 
-Trigger activates when index touches/crosses the short strike:
+Trigger activates when index touches/crosses a relevant option strike:
 
 - crossing: `(prev_index - strike) * (curr_index - strike) <= 0`
 - touch: `curr_index == strike`
 
 At trigger:
 
-- Compute total unrealized PnL from best bid/ask and entry prices
-- If `PnL >= 5` USD: close all positions and stop
-- If `PnL < 5` USD:
-  - buy back the opposite short leg
-  - keep the breached short leg in place
-  - open the opposite short leg at the same strike to form a short straddle
-  - buy iron fly wings to convert the short straddle into an iron fly
-
-Resulting structure: iron fly after adjustment via a short straddle
+- compute current PnL from best bid/ask and entry prices
+- if overall strategy PnL reaches the configured profit target, exit all positions
+- otherwise, adjust between short straddle and short strangle as needed
 
 ## Setup
 
@@ -111,17 +102,17 @@ python -m pytest tests/test_strategy_workflow.py -k test_short_straddle_monitor_
 - `DELTA_API_KEY`
 - `DELTA_API_SECRET`
 - `DELTA_BASE_URL` (default: `https://cdn-ind.testnet.deltaex.org`)
-- `DELTA_SSL_VERIFY` (default: `false` for testnet environments with missing CA chain)
-- `POLL_INTERVAL_SECONDS` (default: `2`)
-- `MAX_SINGLE_ORDER_QTY` (default: `10`)
-- `MAX_TOTAL_OPTION_NOTIONAL` (default: `100000`)
-- `PROFIT_CAPTURE_RATIO` (default: `0.5` for 50% of total premium received)
-- `LEG_EXIT_BUFFER` (default: `10` — added to total premium to form leg-wise exit threshold)
+- `DELTA_SSL_VERIFY` (default: `false`)
+- `POLL_INTERVAL_SECONDS` (default: `0.2`)
+- `STRIKE_ADJUSTMENT_THRESHOLD` (default: `1000`)
+- `PROFIT_TARGET` (default: `50`)
+- `STOP_LOSS` (default: `100`)
+- `LOG_LEVEL` (default: `INFO`)
 
 Heartbeat logs run on the same interval as `POLL_INTERVAL_SECONDS`.
 
 ## Notes
 
-- The code uses `delta-rest-client` and wraps sync calls with `asyncio.to_thread`.
+- The code uses `delta-rest-client` and wraps sync methods with `asyncio.to_thread` for compatibility.
 - Delta REST field names can vary by account/product type. Mapping logic is centralized in `src/models.py` and `src/exchange_client.py`.
-- Test only on testnet first.
+- Test first on a non-production Delta environment.

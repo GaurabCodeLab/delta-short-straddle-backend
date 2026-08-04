@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Optional
 
 
 @dataclass(slots=True)
@@ -33,18 +32,3 @@ class ShortStraddle:
 class ShortStrangle:
     put_leg: OptionLeg
     call_leg: OptionLeg
-
-@dataclass(slots=True)
-class ShortStraddleBreakeven:
-    strike: float
-    total_premium_received: float
-    lower_breakeven: float
-    upper_breakeven: float
-
-
-@dataclass(slots=True)
-class MarketSnapshot:
-    index_price: float
-    short_leg_quote: Quote
-    long_leg_quote: Quote
-    opposite_leg_quote: Optional[Quote] = None

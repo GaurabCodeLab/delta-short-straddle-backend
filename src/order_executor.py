@@ -29,7 +29,6 @@ class OrderExecutor:
     ) -> float:
         """
         Submit one full-size market IOC order and reconcile its fill once.
-        This intentionally does not split by max_single_order_qty.
         """
         if size <= 0:
             raise ValueError("Order quantity must be positive")

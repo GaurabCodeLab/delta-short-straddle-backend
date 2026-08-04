@@ -73,14 +73,18 @@ class DeltaExchangeClient:
                 return await asyncio.to_thread(method)
             raise
 
-    async def get_index_price(self, symbol: str = "BTCUSD") -> float:
+    async def get_index_price(self, symbol: str = "BTCUSDT") -> float:
         try:
-            data = await self._call("get_ticker", **{"identifier": "BTCUSD", "auth": True})
-            price = data.get("spot_price")
-            if price is not None:
-                return float(price)
-        except Exception:   
-            raise ExchangeClientError("Unable to fetch BTC index price from client methods.")
+            data = await self._call("get_ticker", **{"identifier": symbol, "auth": True})
+            if isinstance(data, dict):
+                price = data.get("spot_price")
+                if price is None:
+                    price = data.get("last_price")
+                if price is not None:
+                    return float(price)
+        except Exception as exc:
+            raise ExchangeClientError("Unable to fetch BTC index price from client methods.") from exc
+        raise ExchangeClientError(f"Unable to extract BTC index price from ticker response for symbol={symbol}")
 
     async def get_open_positions_raw(self) -> List[Dict[str, Any]]:
         last_error = None     
@@ -103,10 +107,8 @@ class DeltaExchangeClient:
         """Return signed net position size for a product (positive long, negative short)."""
         positions = await self.get_open_positions_raw()
         for pos in positions:
-            try:              
-                product = pos.get("product") if isinstance(pos.get("product"), dict) else None
-                if product is not None:
-                    pid = int(pos.get("product_id"))
+            try:
+                pid = int(pos.get("product_id"))
                 if pid != product_id:
                     continue
                 return float(pos.get("size"))

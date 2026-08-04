@@ -1,15 +1,14 @@
 from __future__ import annotations
 
 import asyncio
-import contextlib
-import json
 import logging
+import math
 from dataclasses import dataclass
 from typing import Optional
 
 from src.config import Settings
 from src.exchange_client import DeltaExchangeClient
-from src.models import ShortStraddle
+from src.models import ShortStraddle, ShortStrangle
 from src.order_executor import OrderExecutor
 from src.position_manager import PositionManager
 
@@ -42,6 +41,9 @@ class StrategyEngine:
         self.state = StrategyState()
         self._adjustment_lock = asyncio.Lock()
         self._exit_lock = asyncio.Lock()
+        self._atm_reference_strike: Optional[float] = None
+        self._current_structure: str = "unknown"
+        self._realized_pnl = 0.0
 
     def _set_status(self, message: str) -> None:
         self.state.status_message = message
@@ -61,106 +63,120 @@ class StrategyEngine:
         self.state.trigger_price = trigger_price
         self.state.trigger_pnl = trigger_pnl
 
-    def _compute_profit_threshold(self, total_premium_received: float) -> float:
-        return total_premium_received * self.settings.profit_capture_ratio
+    @staticmethod
+    def _is_valid_short_straddle(straddle: ShortStraddle | None) -> bool:
+        if straddle is None:
+            return False
+        if straddle.put_leg is None or straddle.call_leg is None:
+            return False
+        if straddle.put_leg.option_type.lower() != "put" or straddle.call_leg.option_type.lower() != "call":
+            return False
+        if straddle.put_leg.expiry.date() != straddle.call_leg.expiry.date():
+            return False
+        if straddle.put_leg.size >= 0 or straddle.call_leg.size >= 0:
+            return False
+        if not math.isclose(abs(straddle.put_leg.size), abs(straddle.call_leg.size), rel_tol=0, abs_tol=1e-8):
+            return False
+        return math.isclose(straddle.put_leg.strike, straddle.call_leg.strike, rel_tol=0, abs_tol=1e-8)
 
-    def _compute_leg_exit_threshold(self, leg_premium_value: float) -> float:
-        return (leg_premium_value*2) + self.settings.leg_exit_buffer
+    @staticmethod
+    def _is_valid_short_strangle(strangle: ShortStrangle | None) -> bool:
+        if strangle is None:
+            return False
+        if strangle.put_leg is None or strangle.call_leg is None:
+            return False
+        if strangle.put_leg.option_type.lower() != "put" or strangle.call_leg.option_type.lower() != "call":
+            return False
+        if strangle.put_leg.expiry.date() != strangle.call_leg.expiry.date():
+            return False
+        if strangle.put_leg.size >= 0 or strangle.call_leg.size >= 0:
+            return False
+        if math.isclose(strangle.put_leg.strike, strangle.call_leg.strike, rel_tol=0, abs_tol=1e-8):
+            return False
+        return True
 
     @staticmethod
     def _compute_leg_market_value(leg, quote) -> float:
         return abs(leg.size) * leg.contract_value * quote.best_ask
 
+    @staticmethod
+    def _calculate_realized_pnl_from_close(leg, quote) -> float:
+        if leg.size > 0:
+            return abs(leg.size) * leg.contract_value * (quote.best_bid - leg.entry_price)
+        return abs(leg.size) * leg.contract_value * (leg.entry_price - quote.best_ask)
+
+    async def _cancel_pending_orders(self) -> None:
+        cancel_orders = getattr(self.exchange, "cancel_all_orders", None)
+        if callable(cancel_orders):
+            try:
+                await cancel_orders()
+            except Exception as exc:
+                LOGGER.warning("Unable to cancel pending orders: %s", exc)
+            return
+        LOGGER.info("No pending-order cancellation support available in exchange client")
+
+    async def _close_all_open_option_positions(self) -> None:
+        legs = await self.exchange.parse_option_positions()
+        if not legs:
+            LOGGER.info("No open option positions found to close")
+            return
+
+        for leg in legs:
+            size = abs(leg.size)
+            if size <= 0:
+                continue
+            side = "buy" if leg.size < 0 else "sell"
+            try:
+                quote = await self.exchange.get_best_quote(leg.product_id)
+                self._realized_pnl += self._calculate_realized_pnl_from_close(leg, quote)
+            except Exception:
+                LOGGER.debug("Unable to compute realized P&L for closing leg %s", leg.product_id)
+            await self.executor.execute_market_single_submission_with_fill_confirmation(
+                product_id=leg.product_id,
+                side=side,
+                size=size,
+                reduce_only=True,
+            )
+
     async def _close_short_straddle(self, straddle: ShortStraddle) -> None:
         async with self._exit_lock:
             submitted_orders = []
             for leg in (straddle.put_leg, straddle.call_leg):
-                observed_leg = await self.positions.find_open_option_leg(
+                current_leg = await self.positions.find_open_option_leg(
                     option_type=leg.option_type,
                     strike=leg.strike,
                     expiry=leg.expiry,
                     side="short",
                 )
-                if observed_leg is None:
-                    LOGGER.info(
-                        "Short straddle leg already closed: %s %s %s",
-                        leg.option_type,
-                        leg.strike,
-                        leg.expiry,
-                    )
+                if current_leg is None:
                     continue
 
-                size = abs(observed_leg.size)
-                side = "buy" if observed_leg.size < 0 else "sell"
+                size = abs(current_leg.size)
                 try:
-                    filled = await self.executor.execute_market_single_submission_with_fill_confirmation(
-                        product_id=observed_leg.product_id,
-                        side=side,
-                        size=size,
-                        reduce_only=True,
-                    )
+                    quote = await self.exchange.get_best_quote(current_leg.product_id)
+                    self._realized_pnl += self._calculate_realized_pnl_from_close(current_leg, quote)
                 except Exception:
-                    LOGGER.exception(
-                        "Failed to close short straddle leg %s %s",
-                        observed_leg.product_id,
-                        observed_leg.symbol,
-                    )
-                    raise
-
+                    LOGGER.debug("Unable to compute realized P&L for closing leg %s", current_leg.product_id)
+                filled = await self.executor.execute_market_single_submission_with_fill_confirmation(
+                    product_id=current_leg.product_id,
+                    side="buy",
+                    size=size,
+                    reduce_only=True,
+                )
                 submitted_orders.append(
                     {
-                        "product_id": observed_leg.product_id,
-                        "symbol": observed_leg.symbol,
-                        "side": side,
-                        "requested_size": size,
+                        "product_id": current_leg.product_id,
                         "filled_size": filled,
+                        "requested_size": size,
                     }
                 )
-                if filled < size:
-                    LOGGER.warning(
-                        "Partial close for short straddle leg %s: filled=%s requested=%s",
-                        observed_leg.product_id,
-                        filled,
-                        size,
-                    )
 
-            await asyncio.sleep(0.5)
-            remaining_put = await self.positions.find_open_option_leg(
-                option_type="put",
-                strike=straddle.put_leg.strike,
-                expiry=straddle.put_leg.expiry,
-                side="short",
-            )
-            remaining_call = await self.positions.find_open_option_leg(
-                option_type="call",
-                strike=straddle.call_leg.strike,
-                expiry=straddle.call_leg.expiry,
-                side="short",
-            )
-
-            LOGGER.info(
-                "Short straddle exit summary | strategy=short_straddle | submitted_orders=%s | remaining_put=%s | remaining_call=%s",
-                submitted_orders,
-                bool(remaining_put),
-                bool(remaining_call),
-            )
-
-            if remaining_put is not None or remaining_call is not None:
-                raise RuntimeError(
-                    "Short straddle exit failed to close all legs. Remaining positions detected."
-                )
+            await asyncio.sleep(0.1)
+            LOGGER.info("Short straddle exit summary | submitted_orders=%s", submitted_orders)
 
     async def _monitor_short_straddle(self, straddle: ShortStraddle) -> None:
-        total_premium_received = self.positions.compute_total_premium_received(straddle)
-        profit_threshold = total_premium_received * self.settings.short_straddle_profit_capture_ratio
-        loss_threshold = -total_premium_received * self.settings.short_straddle_max_loss_ratio
-        LOGGER.info(
-            "Monitoring short straddle | strike=%s expiry=%s profit_threshold=%.4f loss_threshold=%.4f",
-            straddle.put_leg.strike,
-            straddle.put_leg.expiry.date().isoformat(),
-            profit_threshold,
-            loss_threshold,
-        )
+        profit_threshold = self.settings.profit_target
+        loss_threshold = -self.settings.stop_loss
 
         while True:
             current_put = await self.positions.find_open_option_leg(
@@ -175,80 +191,29 @@ class StrategyEngine:
                 expiry=straddle.call_leg.expiry,
                 side="short",
             )
-
             if current_put is None and current_call is None:
-                LOGGER.info(
-                    "Short straddle already closed before exit logic ran | strike=%s expiry=%s",
-                    straddle.put_leg.strike,
-                    straddle.put_leg.expiry.date().isoformat(),
-                )
                 return
 
             if current_put is None or current_call is None:
-                LOGGER.info(
-                    "Short straddle partial state detected; closing remaining leg(s) | put_exists=%s call_exists=%s",
-                    current_put is not None,
-                    current_call is not None,
-                )
-                await self._close_short_straddle(straddle)
+                # Do not perform a partial (single-leg) close here. Instead,
+                # perform a full strategy exit to ensure we only ever close
+                # all positions on overall strategy exit conditions.
+                await self._exit_strategy("stop_loss")
                 return
 
-            put_q = None
-            call_q = None
-            leg_details = {}
             total_pnl = 0.0
-            missing_prices = []
-
-            if current_put is not None:
+            missing_prices = False
+            for leg in (current_put, current_call):
                 try:
-                    put_q = await self.exchange.get_best_quote(current_put.product_id)
-                    put_pnl = abs(current_put.size) * current_put.contract_value * (
-                        current_put.entry_price - put_q.best_ask
-                    )
-                    total_pnl += put_pnl
-                    leg_details["put"] = {
-                        "product_id": current_put.product_id,
-                        "symbol": current_put.symbol,
-                        "strike": current_put.strike,
-                        "entry_price": current_put.entry_price,
-                        "best_ask": put_q.best_ask,
-                        "pnl": round(put_pnl, 8),
-                    }
-                except Exception as exc:
-                    missing_prices.append(f"put:{current_put.product_id}")
-                    LOGGER.warning(
-                        "Missing put market price for short straddle monitoring %s: %s",
-                        current_put.product_id,
-                        str(exc),
-                    )
+                    quote = await self.exchange.get_best_quote(leg.product_id)
+                except Exception:
+                    missing_prices = True
+                    continue
 
-            if current_call is not None:
-                try:
-                    call_q = await self.exchange.get_best_quote(current_call.product_id)
-                    call_pnl = abs(current_call.size) * current_call.contract_value * (
-                        current_call.entry_price - call_q.best_ask
-                    )
-                    total_pnl += call_pnl
-                    leg_details["call"] = {
-                        "product_id": current_call.product_id,
-                        "symbol": current_call.symbol,
-                        "strike": current_call.strike,
-                        "entry_price": current_call.entry_price,
-                        "best_ask": call_q.best_ask,
-                        "pnl": round(call_pnl, 8),
-                    }
-                except Exception as exc:
-                    missing_prices.append(f"call:{current_call.product_id}")
-                    LOGGER.warning(
-                        "Missing call market price for short straddle monitoring %s: %s",
-                        current_call.product_id,
-                        str(exc),
-                    )
+                pnl = abs(leg.size) * leg.contract_value * (leg.entry_price - quote.best_ask)
+                total_pnl += pnl
 
-            if not leg_details:
-                LOGGER.warning(
-                    "No market prices available for short straddle legs, waiting before retry"
-                )
+            if missing_prices:
                 await asyncio.sleep(self.settings.poll_interval_seconds)
                 continue
 
@@ -263,32 +228,7 @@ class StrategyEngine:
                 trigger_pnl=total_pnl,
             )
 
-            LOGGER.info(
-                "Short straddle monitor | strike=%s expiry=%s pnl=%.4f profit_threshold=%.4f loss_threshold=%.4f missing_prices=%s leg_details=%s",
-                straddle.put_leg.strike,
-                straddle.put_leg.expiry.date().isoformat(),
-                total_pnl,
-                profit_threshold,
-                loss_threshold,
-                missing_prices,
-                leg_details,
-            )
-
-            if total_pnl >= profit_threshold:
-                LOGGER.info(
-                    "Short straddle exit triggered on profit target | pnl=%.4f threshold=%.4f",
-                    total_pnl,
-                    profit_threshold,
-                )
-                await self._close_short_straddle(straddle)
-                return
-
-            if total_pnl <= loss_threshold:
-                LOGGER.info(
-                    "Short straddle exit triggered on max loss | pnl=%.4f threshold=%.4f",
-                    total_pnl,
-                    loss_threshold,
-                )
+            if total_pnl >= profit_threshold or total_pnl <= loss_threshold:
                 await self._close_short_straddle(straddle)
                 return
 
@@ -320,501 +260,299 @@ class StrategyEngine:
             return (prev_price<strike and curr_price>=strike) or (curr_price >= strike)
         return False
 
-    async def _close_all_open_option_positions(self) -> None:
-        legs = await self.exchange.parse_option_positions()
-        if not legs:
-            LOGGER.info("No open option positions found to close")
-            return
+    async def _convert_straddle_to_strangle(self, straddle: ShortStraddle, current_index_price: float) -> float:
+        if self._atm_reference_strike is None:
+            self._atm_reference_strike = float(straddle.put_leg.strike)
 
-        for leg in legs:
-            size = abs(leg.size)
-            if size <= 0:
-                continue
-            side = "buy" if leg.size < 0 else "sell"
-            try:
-                await self.executor.execute_market_single_submission_with_fill_confirmation(
-                    product_id=leg.product_id,
-                    side=side,
-                    size=size,
-                    reduce_only=True,
-                )
-            except Exception:
-                LOGGER.exception(
-                    "Failed to close option leg product_id=%s size=%s side=%s",
-                    leg.product_id,
-                    size,
-                    side,
-                )
-
-    async def _convert_short_straddle_to_iron_fly(self, straddle, breakevens) -> tuple[float, float]:
-        wing_put_strike, wing_call_strike = await self.positions.nearest_strikes_for_breakeven_points(
-            straddle,
-            breakevens.lower_breakeven,
-            breakevens.upper_breakeven,
-        )
-
-        put_product = await self.positions.get_option_product_for_strike(
-            option_type="put",
-            strike=wing_put_strike,
-            expiry=straddle.put_leg.expiry,
-        )
-        call_product = await self.positions.get_option_product_for_strike(
-            option_type="call",
-            strike=wing_call_strike,
-            expiry=straddle.call_leg.expiry,
-        )
-        if put_product is None or call_product is None:
-            raise RuntimeError(
-                f"Could not find iron-fly wing contracts put={wing_put_strike} call={wing_call_strike}"
+        if current_index_price >= self._atm_reference_strike + self.settings.strike_adjustment_threshold:
+            qty = abs(straddle.call_leg.size)
+            await self.executor.execute_market_single_submission_with_fill_confirmation(
+                product_id=straddle.call_leg.product_id,
+                side="buy",
+                size=qty,
+                reduce_only=True,
             )
-
-        put_qty = abs(straddle.put_leg.size)
-        call_qty = abs(straddle.call_leg.size)
-
-        LOGGER.info(
-            "Converting short straddle to iron fly center=%.2f wing_put=%.2f wing_call=%.2f qty_put=%s qty_call=%s",
-            straddle.put_leg.strike,
-            wing_put_strike,
-            wing_call_strike,
-            put_qty,
-            call_qty,
-        )
-
-        put_filled = await self.executor.execute_market_single_submission_with_fill_confirmation(
-            product_id=int(put_product["id"]),
-            side="buy",
-            size=put_qty,
-            reduce_only=False,
-        )
-        if put_filled < put_qty:
-            raise RuntimeError(f"Put wing open partial after retries: {put_filled}/{put_qty}")
-
-        # Small delay to ensure position updates propagate
-        await asyncio.sleep(0.5)
-
-        call_filled = await self.executor.execute_market_single_submission_with_fill_confirmation(
-            product_id=int(call_product["id"]),
-            side="buy",
-            size=call_qty,
-            reduce_only=False,
-        )
-        if call_filled < call_qty:
-            raise RuntimeError(f"Call wing open partial after retries: {call_filled}/{call_qty}")
-
-        # Additional delay to ensure all position updates are propagated
-        await asyncio.sleep(1.0)
-
-        LOGGER.info(
-            "Iron fly conversion complete center=%.2f put_wing=%.2f call_wing=%.2f",
-            straddle.put_leg.strike,
-            wing_put_strike,
-            wing_call_strike,
-        )
-        return wing_put_strike, wing_call_strike
-
-    async def _convert_strangle_to_straddle_and_iron_fly(self, strangle) -> None:
-        """
-        Atomic flow for strangle adjustment:
-        1) Square off the opposite short leg (the one not breached)
-        2) Sell the opposite option at the same strike to form a short straddle
-        3) Convert the short straddle to an iron fly (buy wings)
-        """
-        async with self._adjustment_lock:
-            remaining_put = await self.positions.find_open_option_leg(
-                option_type="put",
-                strike=strangle.put_leg.strike,
-                expiry=strangle.put_leg.expiry,
-                side="short",
-            )
-            remaining_call = await self.positions.find_open_option_leg(
+            new_strike = current_index_price + self.settings.strike_adjustment_threshold
+            new_product = await self.positions.get_option_product_for_strike(
                 option_type="call",
-                strike=strangle.call_leg.strike,
+                strike=new_strike,
+                expiry=straddle.call_leg.expiry,
+            )
+            if new_product is None:
+                raise RuntimeError(f"Could not find call product for straddle->strangle conversion at strike {new_strike}")
+            await self.executor.execute_market_single_submission_with_fill_confirmation(
+                product_id=int(new_product["id"]),
+                side="sell",
+                size=qty,
+                reduce_only=False,
+            )
+            self._current_structure = "strangle"
+            return new_strike
+
+        if current_index_price <= self._atm_reference_strike - self.settings.strike_adjustment_threshold:
+            qty = abs(straddle.put_leg.size)
+            await self.executor.execute_market_single_submission_with_fill_confirmation(
+                product_id=straddle.put_leg.product_id,
+                side="buy",
+                size=qty,
+                reduce_only=True,
+            )
+            new_strike = current_index_price - self.settings.strike_adjustment_threshold
+            new_product = await self.positions.get_option_product_for_strike(
+                option_type="put",
+                strike=new_strike,
+                expiry=straddle.put_leg.expiry,
+            )
+            if new_product is None:
+                raise RuntimeError(f"Could not find put product for straddle->strangle conversion at strike {new_strike}")
+            await self.executor.execute_market_single_submission_with_fill_confirmation(
+                product_id=int(new_product["id"]),
+                side="sell",
+                size=qty,
+                reduce_only=False,
+            )
+            self._current_structure = "strangle"
+            return new_strike
+
+        raise RuntimeError("No straddle-to-strangle adjustment required")
+
+    async def _convert_strangle_to_straddle(self, strangle: ShortStrangle, current_index_price: float) -> float:
+        if current_index_price >= strangle.call_leg.strike:
+            qty = abs(strangle.put_leg.size)
+            await self.executor.execute_market_single_submission_with_fill_confirmation(
+                product_id=strangle.put_leg.product_id,
+                side="buy",
+                size=qty,
+                reduce_only=True,
+            )
+            new_product = await self.positions.get_option_product_for_strike(
+                option_type="put",
+                strike=current_index_price,
+                expiry=strangle.put_leg.expiry,
+            )
+            if new_product is None:
+                raise RuntimeError(f"Could not find put product for strangle->straddle conversion at strike {current_index_price}")
+            await self.executor.execute_market_single_submission_with_fill_confirmation(
+                product_id=int(new_product["id"]),
+                side="sell",
+                size=qty,
+                reduce_only=False,
+            )
+            self._atm_reference_strike = float(current_index_price)
+            self._current_structure = "straddle"
+            return float(current_index_price)
+
+        if current_index_price <= strangle.put_leg.strike:
+            qty = abs(strangle.call_leg.size)
+            await self.executor.execute_market_single_submission_with_fill_confirmation(
+                product_id=strangle.call_leg.product_id,
+                side="buy",
+                size=qty,
+                reduce_only=True,
+            )
+            new_product = await self.positions.get_option_product_for_strike(
+                option_type="call",
+                strike=current_index_price,
                 expiry=strangle.call_leg.expiry,
-                side="short",
+            )
+            if new_product is None:
+                raise RuntimeError(f"Could not find call product for strangle->straddle conversion at strike {current_index_price}")
+            await self.executor.execute_market_single_submission_with_fill_confirmation(
+                product_id=int(new_product["id"]),
+                side="sell",
+                size=qty,
+                reduce_only=False,
+            )
+            self._atm_reference_strike = float(current_index_price)
+            self._current_structure = "straddle"
+            return float(current_index_price)
+
+        raise RuntimeError("No strangle-to-straddle adjustment required")
+
+    async def _calculate_strategy_pnl(self) -> tuple[float, float, float]:
+        realized_pnl = self._realized_pnl
+        try:
+            open_legs = await self.exchange.parse_option_positions()
+        except Exception:
+            open_legs = []
+
+        unrealized_pnl = 0.0
+        for leg in open_legs:
+            try:
+                quote = await self.exchange.get_best_quote(leg.product_id)
+            except Exception:
+                continue
+            unrealized_pnl += self._calculate_realized_pnl_from_close(leg, quote)
+
+        return realized_pnl, unrealized_pnl, realized_pnl + unrealized_pnl
+
+    async def _exit_strategy(self, reason: str) -> None:
+        await self._close_all_open_option_positions()
+        await self._cancel_pending_orders()
+        self.state.triggered = True
+        if reason == "profit":
+            self._set_strategy_state(
+                action="completed",
+                status="Completed - Profit Target Reached",
+                status_message="Overall strategy P&L reached the profit target and all positions were closed",
+                trigger_price=None,
+                trigger_pnl=self.state.trigger_pnl,
+            )
+        else:
+            self._set_strategy_state(
+                action="completed",
+                status="Completed - Stop Loss Hit",
+                status_message="Overall strategy P&L reached the stop loss and all positions were closed",
+                trigger_price=None,
+                trigger_pnl=self.state.trigger_pnl,
             )
 
-            # If put remains, sell call at same strike; if call remains, sell put at same strike
-            if remaining_put is not None and remaining_call is None:
-                base_leg = remaining_put
-                opposite_symbol = base_leg.symbol
-                if opposite_symbol.startswith("P-"):
-                    opposite_symbol = "C-" + opposite_symbol[2:]
-                elif opposite_symbol.startswith("C-"):
-                    opposite_symbol = "P-" + opposite_symbol[2:]
-                direct = await self.exchange.get_product_by_symbol(opposite_symbol)
-                if not isinstance(direct, dict):
-                    raise RuntimeError("Could not find opposite option contract for strangle->straddle conversion")
-                opposite_product_id = int(direct["id"])
-                sell_qty = abs(base_leg.size)
-                sold = await self.executor.execute_market_single_submission_with_fill_confirmation(
-                    product_id=opposite_product_id,
-                    side="sell",
-                    size=sell_qty,
-                    reduce_only=False,
-                )
-                if sold < sell_qty:
-                    raise RuntimeError(f"Opposite short open partial after retries: {sold}/{sell_qty}")
+    async def _check_strategy_exit_conditions(self) -> bool:
+        _, _, combined_pnl = await self._calculate_strategy_pnl()
+        self.state.trigger_pnl = combined_pnl
+        if combined_pnl >= self.settings.profit_target:
+            await self._exit_strategy("profit")
+            return True
+        if combined_pnl <= -self.settings.stop_loss:
+            await self._exit_strategy("stop_loss")
+            return True
+        return False
 
-            elif remaining_call is not None and remaining_put is None:
-                base_leg = remaining_call
-                opposite_symbol = base_leg.symbol
-                if opposite_symbol.startswith("P-"):
-                    opposite_symbol = "C-" + opposite_symbol[2:]
-                elif opposite_symbol.startswith("C-"):
-                    opposite_symbol = "P-" + opposite_symbol[2:]
-                direct = await self.exchange.get_product_by_symbol(opposite_symbol)
-                if not isinstance(direct, dict):
-                    raise RuntimeError("Could not find opposite option contract for strangle->straddle conversion")
-                opposite_product_id = int(direct["id"])
-                sell_qty = abs(base_leg.size)
-                sold = await self.executor.execute_market_single_submission_with_fill_confirmation(
-                    product_id=opposite_product_id,
-                    side="sell",
-                    size=sell_qty,
-                    reduce_only=False,
-                )
-                if sold < sell_qty:
-                    raise RuntimeError(f"Opposite short open partial after retries: {sold}/{sell_qty}")
+    async def _monitor_short_strangle(self, strangle: ShortStrangle) -> bool:
+        if not self._is_valid_short_strangle(strangle):
+            return False
 
-            else:
-                # Nothing to convert (both legs missing or both present) — bail out
-                raise RuntimeError("Unexpected position state during strangle->straddle conversion")
+        profit_threshold = self.settings.profit_target
+        loss_threshold = -self.settings.stop_loss
 
-            # Small delay for positions to settle
-            await asyncio.sleep(0.5)
+        total_pnl = 0.0
+        for leg in (strangle.put_leg, strangle.call_leg):
+            current_leg = await self.positions.find_open_option_leg(
+                option_type=leg.option_type,
+                strike=leg.strike,
+                expiry=leg.expiry,
+                side="short",
+            )
+            if current_leg is None:
+                continue
+            try:
+                quote = await self.exchange.get_best_quote(current_leg.product_id)
+            except Exception:
+                return False
 
-            # Now detect the short straddle and convert to iron fly using existing helper
+            total_pnl += abs(current_leg.size) * current_leg.contract_value * (
+                current_leg.entry_price - quote.best_ask
+            )
+
+        if total_pnl >= profit_threshold or total_pnl <= loss_threshold:
+            await self._close_short_straddle(strangle)
+            self._set_strategy_state(
+                action="closing short strangle",
+                status="short strangle closed",
+                status_message="closed the short strangle",
+                trigger_price=None,
+                trigger_pnl=None,
+            )
+            return True
+
+        return False
+
+    async def _monitor_dynamic_straddle_strangle(self) -> bool:
+        self._current_structure = "unknown"
+        while True:
+            if await self._check_strategy_exit_conditions():
+                return True
+
+            try:
+                index_price = await self.exchange.get_index_price("BTCUSDT")
+            except Exception as exc:
+                LOGGER.warning("Unable to fetch BTC index price during dynamic adjustment monitoring: %s", exc)
+                await asyncio.sleep(self.settings.poll_interval_seconds)
+                continue
+
+            self.state.last_index_price = index_price
+
             try:
                 straddle = await self.positions.detect_short_straddle()
-            except Exception as exc:
-                raise RuntimeError(f"Failed to detect short straddle after conversion: {exc}") from exc
+            except Exception:
+                straddle = None
 
-            straddle_be = self.positions.compute_straddle_breakevens(straddle)
-            wing_put_strike, wing_call_strike = await self._convert_short_straddle_to_iron_fly(
-                straddle, straddle_be
-            )
-            # Finalize iron fly breakevens (positions monitoring loop will pick this up)
-            return (wing_put_strike, wing_call_strike)
-
-    async def run(self) -> None:
-        strangle = None
-        wait_cycles = 0
-        strangle_scan_task = None
-        total_premium_at_entry: float | None = None
-
-        try:
-            while True:
-                if strangle is None:
+            if self._is_valid_short_straddle(straddle):
+                if self._atm_reference_strike is None:
+                    self._atm_reference_strike = float(straddle.put_leg.strike)
+                self._current_structure = "straddle"
+                if index_price >= self._atm_reference_strike + self.settings.strike_adjustment_threshold:
+                    LOGGER.info(
+                        "Dynamic straddle->strangle adjustment triggered at index %.2f using reference %.2f",
+                        index_price,
+                        self._atm_reference_strike,
+                    )
+                    await self._convert_straddle_to_strangle(straddle, index_price)
                     self._set_strategy_state(
-                        action="waiting for short straddle or short strangle",
-                        status="searching for positions",
-                        status_message="waiting for short straddle or short strangle",
+                        action="adjusting short straddle",
+                        status="strangle formed",
+                        status_message="converted short straddle to short strangle",
                         trigger_price=None,
                         trigger_pnl=None,
                     )
+                    await asyncio.sleep(self.settings.poll_interval_seconds)
+                    continue
 
-                    try:
-                        short_straddle = await self.positions.detect_short_straddle()
-                    except Exception as exc:
-                        short_straddle = None
-                        LOGGER.debug("Short straddle not found: %s", str(exc))
-
-                    if short_straddle is not None:
-                        await self._monitor_short_straddle(short_straddle)
-                        return
-
-                    if strangle_scan_task is None:
-                        strangle_scan_task = asyncio.create_task(self.positions.detect_short_strangle())
-
-                    if strangle_scan_task.done():
-                        try:
-                            strangle = strangle_scan_task.result()
-                            # Capture the total premium at detection time so leg-wise
-                            # thresholds remain stable even if one leg is later closed.
-                            try:
-                                total_premium_at_entry = self.positions.compute_total_premium_received(strangle)
-                            except Exception:
-                                total_premium_at_entry = None
-                            strangle_scan_task = None
-                            self._set_strategy_state(
-                                action="monitoring short-strangle",
-                                status="waiting for trigger",
-                                status_message="short strangle detected",
-                                trigger_price=(f"put-{strangle.put_leg.strike},call-{strangle.call_leg.strike}"),
-                                trigger_pnl=None,
-                            )
-                            LOGGER.info(
-                                "Detected initial short strangle put=%s@%s call=%s@%s",
-                                strangle.put_leg.symbol,
-                                strangle.put_leg.strike,
-                                strangle.call_leg.symbol,
-                                strangle.call_leg.strike,
-                            )
-                        except Exception as exc:
-                            strangle_scan_task = None
-                            wait_cycles += 1
-                            try:
-                                index_price = await self.exchange.get_index_price("BTCUSDT")
-                                self.state.last_index_price = index_price
-                                LOGGER.info(
-                                    "no short strangle found | BTC index=%.2f | attempt=%s | detail=%s",
-                                    index_price,
-                                    wait_cycles,
-                                    str(exc),
-                                )
-                            except Exception:
-                                LOGGER.info(
-                                    "no short strangle found | BTC index=unavailable | attempt=%s | detail=%s",
-                                    wait_cycles,
-                                    str(exc),
-                                )
-                            await asyncio.sleep(self.settings.poll_interval_seconds)
-                            continue
-                    else:
-                        wait_cycles += 1
-                        try:
-                            index_price = await self.exchange.get_index_price("BTCUSDT")
-                            self.state.last_index_price = index_price
-                            LOGGER.info(
-                                "no short strangle found | BTC index=%.2f | attempt=%s | detail=position scan in progress",
-                                index_price,
-                                wait_cycles,
-                            )
-                        except Exception:
-                            LOGGER.info(
-                                "no short strangle found | BTC index=unavailable | attempt=%s | detail=position scan in progress",
-                                wait_cycles,
-                            )
-                        await asyncio.sleep(self.settings.poll_interval_seconds)
-                        continue
+                if index_price <= self._atm_reference_strike - self.settings.strike_adjustment_threshold:
+                    LOGGER.info(
+                        "Dynamic straddle->strangle adjustment triggered at index %.2f using reference %.2f",
+                        index_price,
+                        self._atm_reference_strike,
+                    )
+                    await self._convert_straddle_to_strangle(straddle, index_price)
+                    self._set_strategy_state(
+                        action="adjusting short straddle",
+                        status="strangle formed",
+                        status_message="converted short straddle to short strangle",
+                        trigger_price=None,
+                        trigger_pnl=None,
+                    )
+                    await asyncio.sleep(self.settings.poll_interval_seconds)
+                    continue
 
                 self._set_strategy_state(
-                    action="monitoring short-strangle",
-                    status="waiting for trigger",
-                    status_message="monitoring index and unrealized pnl",
-                    trigger_price=(f"put-{strangle.put_leg.strike},call-{strangle.call_leg.strike}"),
+                    action="monitoring short straddle",
+                    status="waiting for reference drift",
+                    status_message="monitoring short straddle for dynamic adjustment",
+                    trigger_price=None,
                     trigger_pnl=None,
                 )
+                await self._monitor_short_straddle(straddle)
+                return True
 
-                # Re-verify that the strangle still exists on the exchange.
-                try:
-                    await self.positions.detect_short_strangle(require_otm=False)
-                except Exception:
-                    remaining_put = await self.positions.find_open_option_leg(
-                        option_type="put",
-                        strike=strangle.put_leg.strike,
-                        expiry=strangle.put_leg.expiry,
-                        side="short",
-                    )
-                    remaining_call = await self.positions.find_open_option_leg(
-                        option_type="call",
-                        strike=strangle.call_leg.strike,
-                        expiry=strangle.call_leg.expiry,
-                        side="short",
-                    )
-                    if remaining_put is None and remaining_call is None:
-                        LOGGER.info("no short strangle found | positions closed externally, resetting monitor")
-                        strangle = None
-                        total_premium_at_entry = None
-                        self._set_strategy_state(
-                            action="waiting for short strangle",
-                            status="no short strangle found",
-                            status_message="no short strangle found",
-                            trigger_price=None,
-                            trigger_pnl=None,
-                        )
-                        await asyncio.sleep(self.settings.poll_interval_seconds)
-                        continue
-                    LOGGER.info(
-                        "Partial strangle state detected | monitoring remaining leg(s) after external position change"
-                    )
+            try:
+                strangle = await self.positions.detect_short_strangle(require_otm=False)
+            except Exception:
+                strangle = None
+            if self._is_valid_short_strangle(strangle):
+                self._current_structure = "strangle"
 
-                index_price = await self.exchange.get_index_price("BTCUSDT")
-
-                # Determine which legs are currently open (live state)
-                remaining_put = await self.positions.find_open_option_leg(
-                    option_type="put",
+                put_exists = await self.positions.find_open_option_leg(
+                    option_type=strangle.put_leg.option_type,
                     strike=strangle.put_leg.strike,
                     expiry=strangle.put_leg.expiry,
                     side="short",
                 )
-                remaining_call = await self.positions.find_open_option_leg(
-                    option_type="call",
+                call_exists = await self.positions.find_open_option_leg(
+                    option_type=strangle.call_leg.option_type,
                     strike=strangle.call_leg.strike,
                     expiry=strangle.call_leg.expiry,
                     side="short",
                 )
-
-                put_q = None
-                call_q = None
-                if remaining_put is not None:
-                    put_q = await self.exchange.get_best_quote(remaining_put.product_id)
-                if remaining_call is not None:
-                    call_q = await self.exchange.get_best_quote(remaining_call.product_id)
-
-                # Compute PnL for current live legs
-                if remaining_put is not None and remaining_call is not None:
-                    from src.models import ShortStraddle
-
-                    live_straddle = ShortStraddle(put_leg=remaining_put, call_leg=remaining_call)
-                    pnl = await self.positions.compute_straddle_pnl(live_straddle)
-                else:
-                    pnl = 0.0
-                    if remaining_put is not None and put_q is not None:
-                        put_qty = abs(remaining_put.size)
-                        pnl += put_qty * remaining_put.contract_value * (remaining_put.entry_price - put_q.best_ask)
-                    if remaining_call is not None and call_q is not None:
-                        call_qty = abs(remaining_call.size)
-                        pnl += call_qty * remaining_call.contract_value * (remaining_call.entry_price - call_q.best_ask)
-
-                # Use captured entry premium if available to keep thresholds stable
-                total_premium_received = (
-                    total_premium_at_entry
-                    if total_premium_at_entry is not None
-                    else self.positions.compute_total_premium_received(strangle)
-                )
-                profit_threshold = total_premium_received * self.settings.profit_capture_ratio
-
-                LOGGER.info(
-                    "Live monitor index=%.2f put_strike=%.2f call_strike=%.2f unrealized_pnl=%.4f premium_received=%.4f threshold=%.4f ratio=%.2f",
-                    index_price,
-                    strangle.put_leg.strike,
-                    strangle.call_leg.strike,
-                    pnl,
-                    total_premium_received,
-                    profit_threshold,
-                    self.settings.profit_capture_ratio,
-                )
-                if pnl >= profit_threshold:
+                if put_exists is None and call_exists is None:
                     self._set_strategy_state(
-                        action="closing whole position",
-                        status="profit target reached",
-                        status_message=(
-                            f"profit target reached: pnl={pnl:.4f}, "
-                            f"threshold={profit_threshold:.4f}"
-                        ),
+                        action="monitoring dynamic adjustment",
+                        status="no short strangle found",
+                        status_message="no short strangle found",
                         trigger_price=None,
-                        trigger_pnl=pnl,
+                        trigger_pnl=None,
                     )
-                    LOGGER.info(
-                        "Profit capture condition met: pnl %.4f >= %.1f%% premium threshold %.4f; closing all positions",
-                        pnl,
-                        self.settings.profit_capture_ratio * 100,
-                        profit_threshold,
-                    )
-                    await self._close_all_open_option_positions()
-                    return
-                leg_snapshot = {
-                    "event": "strangle_monitor_snapshot",
-                    "index_price": round(index_price, 4),
-                    "unrealized_pnl": round(pnl, 8),
-                    "total_premium_received": round(total_premium_received, 8),
-                    "profit_threshold": round(profit_threshold, 8),
-                    "put_leg": {
-                        "symbol": strangle.put_leg.symbol,
-                        "type": strangle.put_leg.option_type,
-                        "strike": strangle.put_leg.strike,
-                        "quantity": abs(strangle.put_leg.size),
-                        "entry_price": strangle.put_leg.entry_price,
-                        "best_bid": put_q.best_bid,
-                        "best_ask": put_q.best_ask,
-                    },
-                    "call_leg": {
-                        "symbol": strangle.call_leg.symbol,
-                        "type": strangle.call_leg.option_type,
-                        "strike": strangle.call_leg.strike,
-                        "quantity": abs(strangle.call_leg.size),
-                        "entry_price": strangle.call_leg.entry_price,
-                        "best_bid": call_q.best_bid,
-                        "best_ask": call_q.best_ask,
-                    },
-                }
-                LOGGER.info("Snapshot: %s", json.dumps(leg_snapshot, separators=(",", ":")))
-
-                # Leg-wise stop condition uses the same size/contract-value scaling as PnL.
-                try:
-                    async with self._adjustment_lock:
-                        cur_put = await self.positions.find_open_option_leg(
-                            option_type="put",
-                            strike=strangle.put_leg.strike,
-                            expiry=strangle.put_leg.expiry,
-                            side="short",
-                        )
-                        cur_call = await self.positions.find_open_option_leg(
-                            option_type="call",
-                            strike=strangle.call_leg.strike,
-                            expiry=strangle.call_leg.expiry,
-                            side="short",
-                        )
-
-                        if cur_put is not None and put_q is not None:
-                            put_market_value = self._compute_leg_market_value(cur_put, put_q)
-                            put_exit_threshold = self._compute_leg_exit_threshold(
-                                abs(cur_put.size) * cur_put.contract_value * cur_put.entry_price
-                            )
-                            if put_market_value >= put_exit_threshold:
-                                qty = abs(cur_put.size)
-                                LOGGER.info(
-                                    "Put leg market value %.4f >= leg-exit-threshold %.4f; exiting put leg pid=%s qty=%s",
-                                    put_market_value,
-                                    put_exit_threshold,
-                                    cur_put.product_id,
-                                    qty,
-                                )
-                                filled = await self.executor.execute_market_single_submission_with_fill_confirmation(
-                                    product_id=cur_put.product_id,
-                                    side="buy",
-                                    size=qty,
-                                    reduce_only=True,
-                                )
-                                if filled < qty:
-                                    LOGGER.warning("Partial fill closing put leg: %s/%s", filled, qty)
-
-                        if cur_call is not None and call_q is not None:
-                            call_market_value = self._compute_leg_market_value(cur_call, call_q)
-                            call_exit_threshold = self._compute_leg_exit_threshold(
-                                abs(cur_call.size) * cur_call.contract_value * cur_call.entry_price
-                            )
-                            if call_market_value >= call_exit_threshold:
-                                qty = abs(cur_call.size)
-                                LOGGER.info(
-                                    "Call leg market value %.4f >= leg-exit-threshold %.4f; exiting call leg pid=%s qty=%s",
-                                    call_market_value,
-                                    call_exit_threshold,
-                                    cur_call.product_id,
-                                    qty,
-                                )
-                                filled = await self.executor.execute_market_single_submission_with_fill_confirmation(
-                                    product_id=cur_call.product_id,
-                                    side="buy",
-                                    size=qty,
-                                    reduce_only=True,
-                                )
-                                if filled < qty:
-                                    LOGGER.warning("Partial fill closing call leg: %s/%s", filled, qty)
-
-                        # Check live state after attempting exits
-                        cur_put_after = await self.positions.find_open_option_leg(
-                            option_type="put",
-                            strike=strangle.put_leg.strike,
-                            expiry=strangle.put_leg.expiry,
-                            side="short",
-                        )
-                        cur_call_after = await self.positions.find_open_option_leg(
-                            option_type="call",
-                            strike=strangle.call_leg.strike,
-                            expiry=strangle.call_leg.expiry,
-                            side="short",
-                        )
-
-                        if cur_put_after is None and cur_call_after is None:
-                            LOGGER.info("Both legs closed via leg-wise stops or externally; resetting monitor")
-                            strangle = None
-                            total_premium_at_entry = None
-                            await asyncio.sleep(self.settings.poll_interval_seconds)
-                            continue
-                except Exception:
-                    LOGGER.exception("Error while processing leg-wise stop condition")
+                    return True
 
                 triggered_put = self._crossed_or_touched(
                     self.state.last_index_price,
@@ -828,276 +566,65 @@ class StrategyEngine:
                     strangle.call_leg.strike,
                     "call",
                 )
-                self.state.last_index_price = index_price
-
-                triggered_now = triggered_put or triggered_call
-
-                if not self.state.triggered and triggered_now:
-                    self.state.triggered = True
-                    total_premium_received = self.positions.compute_total_premium_received(strangle)
-                    pnl_threshold = total_premium_received * self.settings.profit_capture_ratio
-                    self._set_strategy_state(
-                        action="closing whole position" if pnl >= pnl_threshold else "adjusting short strangle",
-                        status="waiting for closing positions" if pnl >= pnl_threshold else "waiting for adjustment",
-                        status_message="trigger hit, evaluating pnl decision",
-                        trigger_price=None,
-                        trigger_pnl=pnl,
-                    )
+                if triggered_put or triggered_call:
                     LOGGER.info(
-                        "Trigger hit at index=%.2f put=%s call=%s premium_received=%.4f threshold=%.4f",
+                        "Dynamic strangle->straddle adjustment triggered at index %.2f put_strike=%.2f call_strike=%.2f",
                         index_price,
                         strangle.put_leg.strike,
                         strangle.call_leg.strike,
-                        total_premium_received,
-                        pnl_threshold,
                     )
-
-                    if pnl >= pnl_threshold:
-                        self._set_status("closing all positions and exiting")
-                        LOGGER.info(
-                            "PnL %.4f >= 50%% premium threshold %.4f; closing all positions and exiting",
-                            pnl,
-                            pnl_threshold,
-                        )
-                        await self._close_all_open_option_positions()
-                        return
-
-                    # Determine which strike was breached. If both, fallback to closing all.
-                    if triggered_put and not triggered_call:
-                        breached = "put"
-                    elif triggered_call and not triggered_put:
-                        breached = "call"
-                    else:
-                        # both breached -> emergency close
-                        LOGGER.info("Both strikes breached simultaneously; flattening positions")
-                        await self._close_all_open_option_positions()
-                        return
-
-                    # Square off the opposite short leg
-                    try:
-                        if breached == "put":
-                            # buy back the short call
-                            await self.executor.execute_market_single_submission_with_fill_confirmation(
-                                product_id=strangle.call_leg.product_id,
-                                side="buy",
-                                size=abs(strangle.call_leg.size),
-                                reduce_only=True,
-                            )
-                        else:
-                            # buy back the short put
-                            await self.executor.execute_market_single_submission_with_fill_confirmation(
-                                product_id=strangle.put_leg.product_id,
-                                side="buy",
-                                size=abs(strangle.put_leg.size),
-                                reduce_only=True,
-                            )
-                    except Exception:
-                        LOGGER.exception("Failed to square off opposite short during adjustment; attempting emergency flatten")
-                        await self._close_all_open_option_positions()
-                        return
-
-                    # Convert remaining short into short straddle and then to iron fly
-                    try:
-                        wing_put_strike, wing_call_strike = await self._convert_strangle_to_straddle_and_iron_fly(strangle)
-                    except Exception:
-                        LOGGER.exception("Adjustment failed. Emergency flattening remaining legs.")
-                        await self._close_all_open_option_positions()
-                        strangle = None
-                        self._set_strategy_state(
-                            action="waiting for short strangle",
-                            status="no short strangle found",
-                            status_message="no short strangle found",
-                            trigger_price=None,
-                            trigger_pnl=None,
-                        )
-                        await asyncio.sleep(self.settings.poll_interval_seconds)
-                        continue
-
-                    # Conversion succeeded — enter iron fly monitoring (reuse existing block)
+                    await self._convert_strangle_to_straddle(strangle, index_price)
                     self._set_strategy_state(
-                        action="converting short straddle to iron fly",
-                        status="waiting for conversion",
-                        status_message="converting short straddle to iron fly",
+                        action="adjusting short strangle",
+                        status="straddle formed",
+                        status_message="converted short strangle to short straddle",
                         trigger_price=None,
                         trigger_pnl=None,
                     )
-                    straddle = None
-                    breakevens_logged = False
-                    iron_fly_be = None
-                    while True:
-                        try:
-                            straddle = await self.positions.detect_short_straddle()
-                        except Exception:
-                            LOGGER.info(
-                                "Straddle positions closed | exiting straddle monitor"
-                            )
-                            self._set_status("straddle closed")
-                            return
+                    await asyncio.sleep(self.settings.poll_interval_seconds)
+                    continue
 
-                        if iron_fly_be is None:
-                            # compute iron fly breakevens
-                            iron_fly_be = await self.positions.compute_iron_fly_breakevens(
-                                straddle, wing_put_strike, wing_call_strike
-                            )
-                            position_qty = abs(straddle.put_leg.size)
-                            pnl_threshold = position_qty * 0.1
-                            self._set_strategy_state(
-                                action="monitoring iron fly",
-                                status="waiting for trigger",
-                                status_message="monitoring iron fly",
-                                trigger_price=(
-                                    f"upside-{iron_fly_be.upper_breakeven:.2f}, "
-                                    f"downside-{iron_fly_be.lower_breakeven:.2f}"
-                                ),
-                                trigger_pnl=pnl_threshold,
-                            )
+                self._set_strategy_state(
+                    action="monitoring short strangle",
+                    status="waiting for strike touch",
+                    status_message="monitoring short strangle for dynamic adjustment",
+                    trigger_price=None,
+                    trigger_pnl=None,
+                )
+                if await self._monitor_short_strangle(strangle):
+                    return True
+                await asyncio.sleep(self.settings.poll_interval_seconds)
+                continue
 
-                            LOGGER.info(
-                                "Iron fly created! Breakevens: strike=%.2f net_premium=%.6f lower=%.2f upper=%.2f wing_put=%.2f wing_call=%.2f",
-                                iron_fly_be.strike,
-                                iron_fly_be.total_premium_received,
-                                iron_fly_be.lower_breakeven,
-                                iron_fly_be.upper_breakeven,
-                                wing_put_strike,
-                                wing_call_strike,
-                            )
+            LOGGER.warning(
+                "Required initial short straddle position is missing; waiting for a valid short straddle or short strangle"
+            )
+            self._set_strategy_state(
+                action="waiting for short straddle",
+                status="initial position missing",
+                status_message="required initial short straddle position is missing",
+                trigger_price=None,
+                trigger_pnl=None,
+            )
+            await asyncio.sleep(self.settings.poll_interval_seconds)
 
-                        if not breakevens_logged:
-                            breakevens_logged = True
-
-                        iron_fly_pnl = await self.positions.compute_iron_fly_pnl(
-                            straddle,
-                            wing_put_strike,
-                            wing_call_strike,
-                        )
-                        put_wing_leg = await self.positions.find_open_option_leg(
-                            option_type="put",
-                            strike=wing_put_strike,
-                            expiry=straddle.put_leg.expiry,
-                            side="long",
-                        )
-                        call_wing_leg = await self.positions.find_open_option_leg(
-                            option_type="call",
-                            strike=wing_call_strike,
-                            expiry=straddle.call_leg.expiry,
-                            side="long",
-                        )
-                        put_q = await self.exchange.get_best_quote(straddle.put_leg.product_id)
-                        call_q = await self.exchange.get_best_quote(straddle.call_leg.product_id)
-                        index_price_s = await self.exchange.get_index_price("BTCUSDT")
-                        nearest_put_strike, nearest_call_strike = await self.positions.nearest_strikes_for_breakeven_points(
-                            straddle,
-                            iron_fly_be.lower_breakeven,
-                            iron_fly_be.upper_breakeven,
-                        )
-                        straddle_snapshot = {
-                            "event": "iron_fly_monitor_snapshot",
-                            "index_price": round(index_price_s, 4),
-                            "unrealized_pnl": round(iron_fly_pnl, 8),
-                            "breakeven": {
-                                "strike": round(iron_fly_be.strike, 4),
-                                "total_premium_received": round(iron_fly_be.total_premium_received, 8),
-                                "lower": round(iron_fly_be.lower_breakeven, 4),
-                                "upper": round(iron_fly_be.upper_breakeven, 4),
-                                "nearest_put_strike": round(nearest_put_strike, 4),
-                                "nearest_call_strike": round(nearest_call_strike, 4),
-                                "wing_put_strike": round(wing_put_strike, 4),
-                                "wing_call_strike": round(wing_call_strike, 4),
-                            },
-                            "put_leg": {
-                                "symbol": straddle.put_leg.symbol,
-                                "type": straddle.put_leg.option_type,
-                                "strike": straddle.put_leg.strike,
-                                "quantity": abs(straddle.put_leg.size),
-                                "entry_price": straddle.put_leg.entry_price,
-                                "best_bid": put_q.best_bid,
-                                "best_ask": put_q.best_ask,
-                            },
-                            "call_leg": {
-                                "symbol": straddle.call_leg.symbol,
-                                "type": straddle.call_leg.option_type,
-                                "strike": straddle.call_leg.strike,
-                                "quantity": abs(straddle.call_leg.size),
-                                "entry_price": straddle.call_leg.entry_price,
-                                "best_bid": call_q.best_bid,
-                                "best_ask": call_q.best_ask,
-                            },
-                        }
-                        if put_wing_leg is not None:
-                            put_wing_q = await self.exchange.get_best_quote(put_wing_leg.product_id)
-                            straddle_snapshot["put_wing"] = {
-                                "symbol": put_wing_leg.symbol,
-                                "type": put_wing_leg.option_type,
-                                "strike": put_wing_leg.strike,
-                                "quantity": abs(put_wing_leg.size),
-                                "entry_price": put_wing_leg.entry_price,
-                                "best_bid": put_wing_q.best_bid,
-                                "best_ask": put_wing_q.best_ask,
-                            }
-                        if call_wing_leg is not None:
-                            call_wing_q = await self.exchange.get_best_quote(call_wing_leg.product_id)
-                            straddle_snapshot["call_wing"] = {
-                                "symbol": call_wing_leg.symbol,
-                                "type": call_wing_leg.option_type,
-                                "strike": call_wing_leg.strike,
-                                "quantity": abs(call_wing_leg.size),
-                                "entry_price": call_wing_leg.entry_price,
-                                "best_bid": call_wing_q.best_bid,
-                                "best_ask": call_wing_q.best_ask,
-                            }
-                        LOGGER.info("Snapshot: %s", json.dumps(straddle_snapshot, separators=(",", ":")))
-                        
-                        # Log iron fly breakevens prominently
-                        LOGGER.info(
-                            "Iron Fly Breakevens | Strike: %.2f | Net Premium: %.6f | Lower: %.2f | Upper: %.2f | Wings: Put@%.2f Call@%.2f",
-                            iron_fly_be.strike,
-                            iron_fly_be.total_premium_received,
-                            iron_fly_be.lower_breakeven,
-                            iron_fly_be.upper_breakeven,
-                            wing_put_strike,
-                            wing_call_strike,
-                        )
-
-                        position_qty = abs(straddle.put_leg.size)
-                        pnl_threshold = position_qty * 0.1
-                        reached_lower = index_price_s <= iron_fly_be.lower_breakeven
-                        reached_upper = index_price_s >= iron_fly_be.upper_breakeven
-                        pnl_trigger = iron_fly_pnl >= pnl_threshold
-
-                        if pnl_trigger or reached_lower or reached_upper:
-                            self._set_strategy_state(
-                                action="closing whole position",
-                                status="waiting for closing positions",
-                                status_message="closing all positions and exiting",
-                                trigger_price=None,
-                                trigger_pnl=None,
-                            )
-                            reason_parts = []
-                            if pnl_trigger:
-                                reason_parts.append(
-                                    f"unrealized_pnl {iron_fly_pnl:.4f} >= 10% qty threshold {pnl_threshold:.4f}"
-                                )
-                            if reached_lower:
-                                reason_parts.append(
-                                    f"index_price {index_price_s:.4f} reached lower breakeven {iron_fly_be.lower_breakeven:.4f}"
-                                )
-                            if reached_upper:
-                                reason_parts.append(
-                                    f"index_price {index_price_s:.4f} reached upper breakeven {iron_fly_be.upper_breakeven:.4f}"
-                                )
-
-                            LOGGER.info(
-                                "Iron fly exit triggered: %s",
-                                "; ".join(reason_parts),
-                            )
-                            await self._close_all_open_option_positions()
-                            return
-
-                        await asyncio.sleep(self.settings.poll_interval_seconds)
-
+    async def run(self) -> None:
+        try:
+            while True:
+                self._set_strategy_state(
+                    action="monitoring dynamic adjustment",
+                    status="searching for positions",
+                    status_message="monitoring short straddle/strangle transitions",
+                    trigger_price=None,
+                    trigger_pnl=None,
+                )
+                if await self._check_strategy_exit_conditions():
+                    return
+                # _monitor_dynamic_straddle_strangle returns True when it completed
+                # a transition/monitoring cycle and the run loop should return.
+                completed = await self._monitor_dynamic_straddle_strangle()
+                if completed:
+                    return
                 await asyncio.sleep(self.settings.poll_interval_seconds)
         finally:
-            if strangle_scan_task is not None and not strangle_scan_task.done():
-                strangle_scan_task.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await strangle_scan_task
+            LOGGER.info("Dynamic straddle/strangle monitoring loop stopped")

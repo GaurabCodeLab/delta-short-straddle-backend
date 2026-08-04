@@ -16,7 +16,6 @@ from src.logging_config import setup_logging
 from src.models import OptionLeg, Quote, ShortStraddle
 from src.order_executor import OrderExecutor
 from src.position_manager import PositionManager
-from src.risk_manager import RiskManager
 from src.strategy_engine import StrategyEngine, StrategyState
 
 
@@ -105,20 +104,6 @@ def test_setup_logging_configures_root_handler():
     setup_logging("DEBUG")
     root_handlers = logging.getLogger().handlers
     assert any(isinstance(handler, logging.StreamHandler) for handler in root_handlers)
-
-
-def test_risk_manager_validates_quantities_and_notional():
-    manager = RiskManager(max_single_order_qty=10.0, max_total_option_notional=100000.0)
-    manager.validate_order_qty(1.0)
-
-    with pytest.raises(ValueError, match="must be positive"):
-        manager.validate_order_qty(0.0)
-
-    with pytest.raises(ValueError, match="exceeds max"):
-        manager.validate_order_qty(20.0)
-
-    with pytest.raises(ValueError, match="exceeds max"):
-        manager.validate_total_notional(10000.0, 20.0)
 
 
 @pytest.mark.asyncio
@@ -695,12 +680,9 @@ def settings():
         api_secret="secret",
         base_url="https://test",
         poll_interval_seconds=0.1,
-        max_single_order_qty=100,
-        max_total_option_notional=100000,
-        profit_capture_ratio=0.5,
-        short_straddle_profit_capture_ratio=0.5,
-        short_straddle_max_loss_ratio=1.0,
-        leg_exit_buffer=10.0,
+        strike_adjustment_threshold=1000.0,
+        profit_target=50.0,
+        stop_loss=100.0,
         log_level="INFO",
         ssl_verify=False,
     )

@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 from typing import List
 
 from src.exchange_client import DeltaExchangeClient
-from src.models import OptionLeg, ShortStraddle, ShortStraddleBreakeven, ShortStrangle
+from src.models import OptionLeg, ShortStraddle, ShortStrangle
 
 
 class PositionManager:
@@ -119,33 +119,7 @@ class PositionManager:
 
         return None
 
-    async def nearest_strikes_for_breakeven_points(
-        self,
-        straddle: ShortStraddle,
-        lower_breakeven: float,
-        upper_breakeven: float,
-    ) -> tuple[float, float]:
-        await self._ensure_option_strike_cache()
-
-        expiry_key = straddle.put_leg.expiry.date().isoformat()
-        strikes = self._option_strikes_by_expiry.get(expiry_key)
-        if not strikes:
-            return straddle.put_leg.strike, straddle.call_leg.strike
-
-        put_strikes = strikes.get("put", [])
-        call_strikes = strikes.get("call", [])
-
-        if put_strikes:
-            nearest_put = min(put_strikes, key=lambda s: abs(s - lower_breakeven))
-        else:
-            nearest_put = straddle.put_leg.strike
-
-        if call_strikes:
-            nearest_call = min(call_strikes, key=lambda s: abs(s - upper_breakeven))
-        else:
-            nearest_call = straddle.call_leg.strike
-
-        return float(nearest_put), float(nearest_call)
+    
 
     async def detect_short_straddle(self) -> ShortStraddle:
         legs = await self.exchange.parse_option_positions()
@@ -200,117 +174,3 @@ class PositionManager:
             for x in legs
         )
         raise RuntimeError("No short strangle (short put + short call OTM same expiry) found. Legs: " + leg_summary)
-
-    async def compute_straddle_pnl(self, straddle: ShortStraddle) -> float:
-        put_q = await self.exchange.get_best_quote(straddle.put_leg.product_id)
-        call_q = await self.exchange.get_best_quote(straddle.call_leg.product_id)
-
-        put_qty = abs(straddle.put_leg.size)
-        call_qty = abs(straddle.call_leg.size)
-
-        # Short positions: PnL = (entry_price - best_ask) * qty * contract_value
-        put_pnl = put_qty * straddle.put_leg.contract_value * (straddle.put_leg.entry_price - put_q.best_ask)
-        call_pnl = call_qty * straddle.call_leg.contract_value * (straddle.call_leg.entry_price - call_q.best_ask)
-        return put_pnl + call_pnl
-
-    async def compute_iron_fly_pnl(
-        self,
-        straddle: ShortStraddle,
-        wing_put_strike: float,
-        wing_call_strike: float,
-    ) -> float:
-        total_pnl = await self.compute_straddle_pnl(straddle)
-
-        put_wing = await self.find_open_option_leg(
-            option_type="put",
-            strike=wing_put_strike,
-            expiry=straddle.put_leg.expiry,
-            side="long",
-        )
-        call_wing = await self.find_open_option_leg(
-            option_type="call",
-            strike=wing_call_strike,
-            expiry=straddle.call_leg.expiry,
-            side="long",
-        )
-
-        for wing_leg in (put_wing, call_wing):
-            if wing_leg is None:
-                continue
-            wing_quote = await self.exchange.get_best_quote(wing_leg.product_id)
-            wing_qty = abs(wing_leg.size)
-            total_pnl += wing_qty * wing_leg.contract_value * (wing_quote.best_bid - wing_leg.entry_price)
-
-        return total_pnl
-
-    def compute_straddle_breakevens(self, straddle: ShortStraddle) -> ShortStraddleBreakeven:
-        put_exposure = abs(straddle.put_leg.size) * straddle.put_leg.contract_value
-        call_exposure = abs(straddle.call_leg.size) * straddle.call_leg.contract_value
-        if put_exposure <= 0 or call_exposure <= 0:
-            raise RuntimeError("Invalid straddle exposure while calculating breakevens")
-
-        put_premium = put_exposure * straddle.put_leg.entry_price
-        call_premium = call_exposure * straddle.call_leg.entry_price
-        total_premium_received = put_premium + call_premium
-
-        lower_breakeven = straddle.put_leg.strike - (total_premium_received / put_exposure)
-        upper_breakeven = straddle.call_leg.strike + (total_premium_received / call_exposure)
-
-        return ShortStraddleBreakeven(
-            strike=straddle.put_leg.strike,
-            total_premium_received=total_premium_received,
-            lower_breakeven=lower_breakeven,
-            upper_breakeven=upper_breakeven,
-        )
-
-    def compute_total_premium_received(self, straddle: ShortStraddle) -> float:
-        put_exposure = abs(straddle.put_leg.size) * straddle.put_leg.contract_value
-        call_exposure = abs(straddle.call_leg.size) * straddle.call_leg.contract_value
-        if put_exposure <= 0 or call_exposure <= 0:
-            raise RuntimeError("Invalid straddle exposure while calculating total premium received")
-
-        return (put_exposure * straddle.put_leg.entry_price) + (
-            call_exposure * straddle.call_leg.entry_price
-        )
-
-    async def compute_iron_fly_breakevens(
-        self,
-        straddle: ShortStraddle,
-        wing_put_strike: float,
-        wing_call_strike: float,
-    ) -> ShortStraddleBreakeven:
-        straddle_be = self.compute_straddle_breakevens(straddle)
-        
-        put_wing = await self.find_open_option_leg(
-            option_type="put",
-            strike=wing_put_strike,
-            expiry=straddle.put_leg.expiry,
-            side="long",
-        )
-        call_wing = await self.find_open_option_leg(
-            option_type="call",
-            strike=wing_call_strike,
-            expiry=straddle.call_leg.expiry,
-            side="long",
-        )
-        
-        wing_cost = 0.0
-        if put_wing:
-            wing_cost += put_wing.entry_price * abs(put_wing.size) * put_wing.contract_value
-        if call_wing:
-            wing_cost += call_wing.entry_price * abs(call_wing.size) * call_wing.contract_value
-        
-        net_premium_received = straddle_be.total_premium_received - wing_cost
-        
-        put_exposure = abs(straddle.put_leg.size) * straddle.put_leg.contract_value
-        call_exposure = abs(straddle.call_leg.size) * straddle.call_leg.contract_value
-        
-        lower_breakeven = straddle.put_leg.strike - (net_premium_received / put_exposure)
-        upper_breakeven = straddle.call_leg.strike + (net_premium_received / call_exposure)
-        
-        return ShortStraddleBreakeven(
-            strike=straddle.put_leg.strike,
-            total_premium_received=net_premium_received,
-            lower_breakeven=lower_breakeven,
-            upper_breakeven=upper_breakeven,
-        )
