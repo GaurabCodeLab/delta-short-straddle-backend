@@ -14,7 +14,12 @@ LOGGER = logging.getLogger(__name__)
 
 
 class ExchangeClientError(RuntimeError):
-    pass
+    def __str__(self) -> str:
+        base = super().__str__()
+        cause = self.__cause__
+        if cause is not None:
+            return f"{base}: {cause}"
+        return base
 
 
 class DeltaExchangeClient:

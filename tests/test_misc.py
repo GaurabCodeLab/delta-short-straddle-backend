@@ -9,6 +9,7 @@ from typing import Any
 
 import pytest
 import uvicorn
+from fastapi import HTTPException
 
 from src.api import BotManager, JsonLogHandler, build_strategy, manager, health, api_start, api_stop, api_status, api_summary, api_logs
 from src.exchange_client import DeltaExchangeClient, ExchangeClientError
@@ -198,6 +199,36 @@ async def test_bot_manager_collect_summary_propagates_index_price_errors(setting
 
     with pytest.raises(RuntimeError, match="index failed"):
         await manager.collect_summary()
+
+
+@pytest.mark.asyncio
+async def test_bot_manager_collect_summary_includes_nested_error_details(settings):
+    class FailingIndexExchange(DummySummaryExchange):
+        async def get_index_price(self, symbol: str = "BTCUSDT") -> float:
+            raise ExchangeClientError(
+                "Unable to fetch BTC index price from client methods."
+            ) from RuntimeError("IP 1.2.3.4 not whitelisted")
+
+    exchange = FailingIndexExchange()
+    strategy = DummyStrategy()
+    strategy.state = StrategyState()
+    strategy.exchange = exchange
+    manager = BotManager(strategy)
+
+    with pytest.raises(ExchangeClientError, match="IP 1.2.3.4 not whitelisted"):
+        await manager.collect_summary()
+
+
+@pytest.mark.asyncio
+async def test_api_summary_route_includes_nested_error_details(monkeypatch):
+    async def failing_summary():
+        raise ExchangeClientError(
+            "Unable to collect summary"
+        ) from RuntimeError("IP 1.2.3.4 not whitelisted")
+
+    monkeypatch.setattr(manager, "collect_summary", failing_summary)
+    with pytest.raises(HTTPException, match="IP 1.2.3.4 not whitelisted"):
+        await api_summary()
 
 
 def test_build_strategy_uses_configured_components(monkeypatch, settings):
