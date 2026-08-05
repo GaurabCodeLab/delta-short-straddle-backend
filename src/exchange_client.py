@@ -76,17 +76,30 @@ class DeltaExchangeClient:
                 return await asyncio.to_thread(method)
             raise
 
-    async def get_index_price(self, symbol: str = "BTCUSD") -> float:
+    async def get_index_price(self, symbol: str = "BTCUSDT") -> float:
         try:
-            data = await self._call("get_ticker", **{"identifier": "BTCUSD", "auth": True})
+            data = await self._call("get_ticker", **{"identifier": symbol, "auth": True})
+            if not isinstance(data, dict):
+                raise ExchangeClientError("Unexpected ticker response format")
+
             price = data.get("spot_price")
-            if price is not None:
-                return float(price)
-        except Exception:   
-            raise ExchangeClientError("Unable to fetch BTC index price from client methods.")
+            if price is None:
+                result = data.get("result")
+                if isinstance(result, dict):
+                    nested = result.get("data")
+                    if isinstance(nested, dict):
+                        price = nested.get("last_price")
+                    else:
+                        price = result.get("last_price")
+
+            if price is None:
+                raise ExchangeClientError("Quote response missing spot_price or last_price")
+
+            return float(price)
+        except Exception as exc:
+            raise ExchangeClientError("Unable to fetch BTC index price from client methods.") from exc
 
     async def get_open_positions_raw(self) -> List[Dict[str, Any]]:
-        last_error = None     
         try:
             resp = await self._call("request", method="GET", path="/v2/positions/margined", auth=True)
             payload = await asyncio.to_thread(resp.json)
@@ -94,10 +107,10 @@ class DeltaExchangeClient:
             success = payload.get("success")
             if success is False:
                 last_error = payload.get("error") or payload.get("message")
-                raise ExchangeClientError(f"Unable to fetch open positions. Last error: {last_error}")
-            else:
-                result = payload.get("result") or []
-                return result
+                LOGGER.debug(f"Unable to fetch open positions. Last error: {last_error}")
+                return None
+            result = payload.get("result") or []
+            return result
         except Exception as exc:
             LOGGER.debug(f"Margined positions endpoint failed: {str(exc)}")
             last_error = str(exc)
@@ -107,10 +120,11 @@ class DeltaExchangeClient:
         """Return signed net position size for a product (positive long, negative short)."""
         positions = await self.get_open_positions_raw()
         for pos in positions:
-            try:              
+            try:
                 product = pos.get("product") if isinstance(pos.get("product"), dict) else None
-                if product is not None:
-                    pid = int(pos.get("product_id"))
+                if product is None:
+                    continue
+                pid = int(pos.get("product_id"))
                 if pid != product_id:
                     continue
                 return float(pos.get("size"))
@@ -218,7 +232,8 @@ class DeltaExchangeClient:
             best_bid = root.get("best_bid")
             best_ask = root.get("best_ask")
             if best_bid is not None and best_ask is not None:
-                return Quote(best_bid=float(best_bid), best_ask=float(best_ask))              
+                return Quote(best_bid=float(best_bid), best_ask=float(best_ask))
+            raise ExchangeClientError("Quote response missing best_bid or best_ask")
         except Exception as exc:
             error_msg = f"METHOD failed: {str(exc)}"
             LOGGER.debug(f"Quote fetch attempt for product {product_id}: {error_msg}")
@@ -267,6 +282,10 @@ class DeltaExchangeClient:
 
     async def parse_option_positions(self) -> List[OptionLeg]:
         positions = await self.get_open_positions_raw()
+        if not positions:
+            LOGGER.info("No raw positions returned from open positions endpoint")
+            return []
+
         legs: List[OptionLeg] = []
         LOGGER.info(f"Parsing {len(positions)} raw positions")
         

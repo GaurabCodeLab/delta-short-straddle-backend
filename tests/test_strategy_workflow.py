@@ -353,7 +353,35 @@ async def test_get_option_product_for_strike_uses_cached_products():
     assert call_product is not None and call_product["id"] == "2"
 
 
+@pytest.mark.asyncio
+async def test_get_option_product_for_strike_uses_nearest_available_strike():
+    exchange = DummyExchange()
+    expiry = datetime(2026, 12, 31, tzinfo=timezone.utc)
+    exchange._quotes = {}
 
+    async def get_products_raw():
+        return [
+            {
+                "id": "1",
+                "symbol": "P-64000",
+                "contract_type": "put option",
+                "strike_price": "64000",
+                "settlement_time": "2026-12-31T00:00:00Z",
+            },
+            {
+                "id": "2",
+                "symbol": "P-63600",
+                "contract_type": "put option",
+                "strike_price": "63600",
+                "settlement_time": "2026-12-31T00:00:00Z",
+            },
+        ]
+
+    exchange.get_products_raw = get_products_raw
+    positions = PositionManager(exchange)
+
+    product = await positions.get_option_product_for_strike("put", 63550.0, expiry)
+    assert product is not None and product["id"] == "2"
 
 
 @pytest.mark.asyncio

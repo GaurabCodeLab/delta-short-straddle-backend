@@ -89,15 +89,24 @@ class PositionManager:
         if not typed_products:
             return None
 
-        direct = typed_products.get(float(strike))
+        target_strike = float(strike)
+        direct = typed_products.get(target_strike)
         if direct is not None:
             return direct
 
+        closest_product = None
+        closest_distance = float("inf")
         for product_strike, product in typed_products.items():
-            if math.isclose(float(product_strike), float(strike), rel_tol=0, abs_tol=1e-8):
+            strike_value = float(product_strike)
+            if math.isclose(strike_value, target_strike, rel_tol=0, abs_tol=1e-8):
                 return product
 
-        return None
+            distance = abs(strike_value - target_strike)
+            if distance < closest_distance:
+                closest_distance = distance
+                closest_product = product
+
+        return closest_product
 
     async def find_open_option_leg(
         self,
@@ -131,14 +140,15 @@ class PositionManager:
             for call_leg in calls:
                 same_strike = math.isclose(put_leg.strike, call_leg.strike, rel_tol=1e-3)
                 same_expiry = put_leg.expiry.date() == call_leg.expiry.date()
-                if same_strike and same_expiry:
+                same_qty = math.isclose(abs(put_leg.size), abs(call_leg.size), rel_tol=0, abs_tol=1e-8)
+                if same_strike and same_expiry and same_qty:
                     return ShortStraddle(put_leg=put_leg, call_leg=call_leg)
 
         leg_summary = ", ".join(
             f"pid={x.product_id}|{x.option_type}|strike={x.strike}|size={x.size}"
             for x in legs
         )
-        raise RuntimeError("No short straddle (short put + short call same strike) found. Legs: " + leg_summary)
+        raise RuntimeError("No short straddle (short put + short call same strike/expiry/quantity) found. Legs: " + leg_summary)
 
     async def detect_short_strangle(self, require_otm: bool = True) -> ShortStrangle:
         legs = await self.exchange.parse_option_positions()
@@ -158,7 +168,8 @@ class PositionManager:
         for put_leg in puts:
             for call_leg in calls:
                 same_expiry = put_leg.expiry.date() == call_leg.expiry.date()
-                if not same_expiry:
+                same_qty = math.isclose(abs(put_leg.size), abs(call_leg.size), rel_tol=0, abs_tol=1e-8)
+                if not same_expiry or not same_qty:
                     continue
 
                 if require_otm and index_price is not None:

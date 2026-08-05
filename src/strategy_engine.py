@@ -93,6 +93,8 @@ class StrategyEngine:
             return False
         if math.isclose(strangle.put_leg.strike, strangle.call_leg.strike, rel_tol=0, abs_tol=1e-8):
             return False
+        if not math.isclose(abs(strangle.put_leg.size), abs(strangle.call_leg.size), rel_tol=0, abs_tol=1e-8):
+            return False
         return True
 
     @staticmethod
@@ -264,7 +266,8 @@ class StrategyEngine:
         if self._atm_reference_strike is None:
             self._atm_reference_strike = float(straddle.put_leg.strike)
 
-        if current_index_price >= self._atm_reference_strike + self.settings.strike_adjustment_threshold:
+        threshold = self.settings.strike_adjustment_threshold
+        if current_index_price >= self._atm_reference_strike + threshold:
             qty = abs(straddle.call_leg.size)
             await self.executor.execute_market_single_submission_with_fill_confirmation(
                 product_id=straddle.call_leg.product_id,
@@ -272,7 +275,7 @@ class StrategyEngine:
                 size=qty,
                 reduce_only=True,
             )
-            new_strike = current_index_price + self.settings.strike_adjustment_threshold
+            new_strike = self._atm_reference_strike + 2 * threshold
             new_product = await self.positions.get_option_product_for_strike(
                 option_type="call",
                 strike=new_strike,
@@ -289,7 +292,7 @@ class StrategyEngine:
             self._current_structure = "strangle"
             return new_strike
 
-        if current_index_price <= self._atm_reference_strike - self.settings.strike_adjustment_threshold:
+        if current_index_price <= self._atm_reference_strike - threshold:
             qty = abs(straddle.put_leg.size)
             await self.executor.execute_market_single_submission_with_fill_confirmation(
                 product_id=straddle.put_leg.product_id,
@@ -297,7 +300,7 @@ class StrategyEngine:
                 size=qty,
                 reduce_only=True,
             )
-            new_strike = current_index_price - self.settings.strike_adjustment_threshold
+            new_strike = self._atm_reference_strike - 2 * threshold
             new_product = await self.positions.get_option_product_for_strike(
                 option_type="put",
                 strike=new_strike,
@@ -325,22 +328,23 @@ class StrategyEngine:
                 size=qty,
                 reduce_only=True,
             )
+            new_strike = float(strangle.call_leg.strike)
             new_product = await self.positions.get_option_product_for_strike(
                 option_type="put",
-                strike=current_index_price,
+                strike=new_strike,
                 expiry=strangle.put_leg.expiry,
             )
             if new_product is None:
-                raise RuntimeError(f"Could not find put product for strangle->straddle conversion at strike {current_index_price}")
+                raise RuntimeError(f"Could not find put product for strangle->straddle conversion at strike {new_strike}")
             await self.executor.execute_market_single_submission_with_fill_confirmation(
                 product_id=int(new_product["id"]),
                 side="sell",
                 size=qty,
                 reduce_only=False,
             )
-            self._atm_reference_strike = float(current_index_price)
+            self._atm_reference_strike = new_strike
             self._current_structure = "straddle"
-            return float(current_index_price)
+            return new_strike
 
         if current_index_price <= strangle.put_leg.strike:
             qty = abs(strangle.call_leg.size)
@@ -350,22 +354,23 @@ class StrategyEngine:
                 size=qty,
                 reduce_only=True,
             )
+            new_strike = float(strangle.put_leg.strike)
             new_product = await self.positions.get_option_product_for_strike(
                 option_type="call",
-                strike=current_index_price,
+                strike=new_strike,
                 expiry=strangle.call_leg.expiry,
             )
             if new_product is None:
-                raise RuntimeError(f"Could not find call product for strangle->straddle conversion at strike {current_index_price}")
+                raise RuntimeError(f"Could not find call product for strangle->straddle conversion at strike {new_strike}")
             await self.executor.execute_market_single_submission_with_fill_confirmation(
                 product_id=int(new_product["id"]),
                 side="sell",
                 size=qty,
                 reduce_only=False,
             )
-            self._atm_reference_strike = float(current_index_price)
+            self._atm_reference_strike = new_strike
             self._current_structure = "straddle"
-            return float(current_index_price)
+            return new_strike
 
         raise RuntimeError("No strangle-to-straddle adjustment required")
 
