@@ -51,7 +51,10 @@ class DeltaExchangeClient:
             return datetime.fromtimestamp(float(value), tz=timezone.utc)
         if isinstance(value, str):
             # Supports ISO strings ending in Z.
-            return datetime.fromisoformat(value.replace("Z", "+00:00"))
+            try:
+                return datetime.fromisoformat(value.replace("Z", "+00:00"))
+            except ValueError as exc:
+                raise ExchangeClientError(f"Unsupported datetime value: {value}") from exc
         raise ExchangeClientError(f"Unsupported datetime value: {value}")
 
     @retry(
@@ -73,18 +76,14 @@ class DeltaExchangeClient:
                 return await asyncio.to_thread(method)
             raise
 
-    async def get_index_price(self, symbol: str = "BTCUSDT") -> float:
+    async def get_index_price(self, symbol: str = "BTCUSD") -> float:
         try:
-            data = await self._call("get_ticker", **{"identifier": symbol, "auth": True})
-            if isinstance(data, dict):
-                price = data.get("spot_price")
-                if price is None:
-                    price = data.get("last_price")
-                if price is not None:
-                    return float(price)
-        except Exception as exc:
-            raise ExchangeClientError("Unable to fetch BTC index price from client methods.") from exc
-        raise ExchangeClientError(f"Unable to extract BTC index price from ticker response for symbol={symbol}")
+            data = await self._call("get_ticker", **{"identifier": "BTCUSD", "auth": True})
+            price = data.get("spot_price")
+            if price is not None:
+                return float(price)
+        except Exception:   
+            raise ExchangeClientError("Unable to fetch BTC index price from client methods.")
 
     async def get_open_positions_raw(self) -> List[Dict[str, Any]]:
         last_error = None     
@@ -95,6 +94,7 @@ class DeltaExchangeClient:
             success = payload.get("success")
             if success is False:
                 last_error = payload.get("error") or payload.get("message")
+                raise ExchangeClientError(f"Unable to fetch open positions. Last error: {last_error}")
             else:
                 result = payload.get("result") or []
                 return result
@@ -107,8 +107,10 @@ class DeltaExchangeClient:
         """Return signed net position size for a product (positive long, negative short)."""
         positions = await self.get_open_positions_raw()
         for pos in positions:
-            try:
-                pid = int(pos.get("product_id"))
+            try:              
+                product = pos.get("product") if isinstance(pos.get("product"), dict) else None
+                if product is not None:
+                    pid = int(pos.get("product_id"))
                 if pid != product_id:
                     continue
                 return float(pos.get("size"))
@@ -216,10 +218,7 @@ class DeltaExchangeClient:
             best_bid = root.get("best_bid")
             best_ask = root.get("best_ask")
             if best_bid is not None and best_ask is not None:
-                return Quote(best_bid=float(best_bid), best_ask=float(best_ask))
-            raise ExchangeClientError("Quote response missing best_bid or best_ask")
-        except ExchangeClientError:
-            raise
+                return Quote(best_bid=float(best_bid), best_ask=float(best_ask))              
         except Exception as exc:
             error_msg = f"METHOD failed: {str(exc)}"
             LOGGER.debug(f"Quote fetch attempt for product {product_id}: {error_msg}")

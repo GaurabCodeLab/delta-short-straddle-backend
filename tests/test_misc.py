@@ -505,6 +505,17 @@ async def test_exchange_client_get_index_price_raises_when_client_fails():
 
 
 @pytest.mark.asyncio
+async def test_exchange_client_get_index_price_parses_nested_ticker_response():
+    client = DummyDeltaClient()
+
+    async def _call(method_name: str, **kwargs: Any) -> dict[str, Any]:
+        return {"result": {"data": {"last_price": "42000"}}}
+
+    client._call = _call
+    assert await client.get_index_price() == 42000.0
+
+
+@pytest.mark.asyncio
 async def test_exchange_client_get_open_positions_raw_returns_result():
     client = DummyDeltaClient()
 
