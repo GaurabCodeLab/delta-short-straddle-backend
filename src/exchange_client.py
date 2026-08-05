@@ -83,11 +83,19 @@ class DeltaExchangeClient:
 
     async def get_index_price(self, symbol: str = "BTCUSDT") -> float:
         try:
-            data = await self._call("get_ticker", **{"identifier": symbol, "auth": True})
+            data = await self._call("get_ticker", **{"identifier": "BTCUSD", "auth": True})
             if not isinstance(data, dict):
-                raise ExchangeClientError("Unexpected ticker response format")
+                raise ExchangeClientError(
+                    "Unexpected ticker response format: response is not a dict"
+                )
 
-            price = data.get("spot_price")
+            if data.get("success") is False:
+                error_text = data.get("error") or data.get("message") or data.get("result")
+                raise ExchangeClientError(
+                    f"Delta ticker endpoint returned error: {error_text}"
+                )
+
+            price = data.get("spot_price") or data.get("last_price")
             if price is None:
                 result = data.get("result")
                 if isinstance(result, dict):
@@ -98,11 +106,26 @@ class DeltaExchangeClient:
                         price = result.get("last_price")
 
             if price is None:
-                raise ExchangeClientError("Quote response missing spot_price or last_price")
+                ticker = data.get("ticker")
+                if isinstance(ticker, dict):
+                    price = ticker.get("spot_price") or ticker.get("last_price")
+
+            if price is None and isinstance(data.get("result"), dict):
+                result = data["result"]
+                ticker = result.get("ticker")
+                if isinstance(ticker, dict):
+                    price = ticker.get("spot_price") or ticker.get("last_price")
+
+            if price is None:
+                raise ExchangeClientError(
+                    f"Quote response missing spot_price or last_price. Response={data}"
+                )
 
             return float(price)
         except Exception as exc:
-            raise ExchangeClientError("Unable to fetch BTC index price from client methods.") from exc
+            raise ExchangeClientError(
+                "Unable to fetch BTC index price from client methods."
+            ) from exc
 
     async def get_open_positions_raw(self) -> List[Dict[str, Any]]:
         try:

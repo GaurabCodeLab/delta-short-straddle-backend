@@ -547,6 +547,29 @@ async def test_exchange_client_get_index_price_parses_nested_ticker_response():
 
 
 @pytest.mark.asyncio
+async def test_exchange_client_get_index_price_parses_ticker_payload():
+    client = DummyDeltaClient()
+
+    async def _call(method_name: str, **kwargs: Any) -> dict[str, Any]:
+        return {"ticker": {"last_price": "43000"}}
+
+    client._call = _call
+    assert await client.get_index_price() == 43000.0
+
+
+@pytest.mark.asyncio
+async def test_exchange_client_get_index_price_returns_delta_error_message():
+    client = DummyDeltaClient()
+
+    async def _call(method_name: str, **kwargs: Any) -> dict[str, Any]:
+        return {"success": False, "error": "IP 1.2.3.4 not whitelisted"}
+
+    client._call = _call
+    with pytest.raises(ExchangeClientError, match="IP 1.2.3.4 not whitelisted"):
+        await client.get_index_price()
+
+
+@pytest.mark.asyncio
 async def test_exchange_client_get_open_positions_raw_returns_result():
     client = DummyDeltaClient()
 
