@@ -160,17 +160,22 @@ class BotManager:
     def status(self) -> dict[str, Any]:
         with self._lock:
             running = self._task is not None and not self._task.done()
+        strategy_state = {
+            "triggered": self.strategy.state.triggered,
+            "last_index_price": self.strategy.state.last_index_price,
+            "status_message": self.strategy.state.status_message,
+            "action": self.strategy.state.action,
+            "status": self.strategy.state.status,
+            "trigger_price": self.strategy.state.trigger_price,
+            "trigger_pnl": self.strategy.state.trigger_pnl,
+        }
+
+        if not self.strategy.state.status_message:
+            strategy_state["status_message"] = self.strategy.state.status_message or "waiting for strategy state"
+
         return {
             "running": running,
-            "strategy_state": {
-                "triggered": self.strategy.state.triggered,
-                "last_index_price": self.strategy.state.last_index_price,
-                "status_message": self.strategy.state.status_message,
-                "action": self.strategy.state.action,
-                "status": self.strategy.state.status,
-                "trigger_price": self.strategy.state.trigger_price,
-                "trigger_pnl": self.strategy.state.trigger_pnl,
-            },
+            "strategy_state": strategy_state,
         }
 
 def build_strategy() -> StrategyEngine:

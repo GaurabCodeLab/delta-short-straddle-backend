@@ -119,6 +119,61 @@ def test_apply_clock_skew_from_error_updates_offset():
 
 
 @pytest.mark.asyncio
+async def test_monitor_dynamic_straddle_strangle_keeps_monitoring_until_threshold_crossing(settings):
+    class SequenceExchange(DummyExchange):
+        def __init__(self, values):
+            super().__init__()
+            self._values = iter(values)
+
+        async def get_index_price(self, symbol: str = "BTCUSD") -> float:
+            try:
+                return next(self._values)
+            except StopIteration:
+                return 65000.0
+
+    class DummyPositions:
+        def __init__(self, straddle):
+            self._straddle = straddle
+
+        async def detect_short_straddle(self):
+            return self._straddle
+
+    class DummyExecutor:
+        async def execute_market_single_submission_with_fill_confirmation(self, **kwargs):
+            return kwargs.get("size", 0)
+
+    straddle = ShortStraddle(
+        put_leg=make_option_leg(1, "P-64000", "put", 64000.0, -1, 100.0),
+        call_leg=make_option_leg(2, "C-64000", "call", 64000.0, -1, 100.0),
+    )
+    exchange = SequenceExchange([64000.0, 65000.0])
+    positions = DummyPositions(straddle)
+    executor = DummyExecutor()
+    engine = StrategyEngine(exchange=exchange, positions=positions, executor=executor, settings=settings)
+
+    converted = []
+
+    async def fake_check_exit_conditions():
+        return len(converted) > 0
+
+    async def fake_monitor_short_straddle(_straddle):
+        return False
+
+    async def fake_convert(_straddle, price):
+        converted.append(price)
+        return price
+
+    engine._check_strategy_exit_conditions = fake_check_exit_conditions
+    engine._monitor_short_straddle = fake_monitor_short_straddle
+    engine._convert_straddle_to_strangle = fake_convert
+
+    result = await engine._monitor_dynamic_straddle_strangle()
+
+    assert result is True
+    assert converted == [65000.0]
+
+
+@pytest.mark.asyncio
 async def test_premium_capture_and_profit_threshold(settings):
     exchange = DummyExchange()
     positions = PositionManager(exchange)
@@ -149,6 +204,48 @@ async def test_leg_market_value_is_scaled_by_position_size(settings):
     quote = Quote(best_bid=1.0, best_ask=315.0)
 
     assert engine._compute_leg_market_value(leg, quote) == 31500.0
+
+
+@pytest.mark.asyncio
+async def test_convert_straddle_to_strangle_records_realized_pnl_for_closed_leg(settings, monkeypatch):
+    exchange = DummyExchange()
+    positions = PositionManager(exchange)
+    executor = DummyOrderExecutor(exchange)
+    engine = StrategyEngine(exchange, positions, executor, settings)
+
+    straddle = ShortStraddle(
+        put_leg=make_option_leg(1, "P-64000", "put", 64000.0, -1.0, 100.0),
+        call_leg=make_option_leg(2, "C-64000", "call", 64000.0, -1.0, 100.0),
+    )
+    exchange._quotes[1] = Quote(best_bid=90.0, best_ask=90.0)
+    exchange._quotes[2] = Quote(best_bid=90.0, best_ask=90.0)
+
+    async def fake_get_option_product_for_strike(option_type: str, strike: float, expiry):
+        return {"id": "3" if option_type == "call" else "4"}
+
+    positions.get_option_product_for_strike = fake_get_option_product_for_strike
+
+    await engine._convert_straddle_to_strangle(straddle, 65000.0)
+
+    assert engine._realized_pnl == pytest.approx(10.0)
+
+
+@pytest.mark.asyncio
+async def test_get_active_short_option_legs_returns_only_short_positions(settings):
+    exchange = DummyExchange()
+    positions = PositionManager(exchange)
+    executor = DummyOrderExecutor(exchange)
+    engine = StrategyEngine(exchange, positions, executor, settings)
+
+    exchange._positions = [
+        make_option_leg(1, "P-64000", "put", 64000.0, -1.0, 100.0),
+        make_option_leg(2, "C-64000", "call", 64000.0, -1.0, 100.0),
+        make_option_leg(3, "C-65000", "call", 65000.0, 1.0, 110.0),
+    ]
+
+    legs = await engine._get_active_short_option_legs()
+
+    assert [leg.product_id for leg in legs] == [1, 2]
 
 
 @pytest.mark.asyncio
@@ -731,4 +828,4 @@ async def test_run_resets_state_when_short_strangle_closes_externally(settings):
     with contextlib.suppress(asyncio.CancelledError):
         await task
 
-    assert engine.state.status == "no short strangle found"
+    assert engine.state.status == "position mismatch"

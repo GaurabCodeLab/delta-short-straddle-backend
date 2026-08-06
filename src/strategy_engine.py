@@ -140,6 +140,18 @@ class StrategyEngine:
                 reduce_only=True,
             )
 
+    async def _record_realized_pnl_for_close(self, leg) -> None:
+        try:
+            quote = await self.exchange.get_best_quote(leg.product_id)
+        except Exception:
+            LOGGER.debug("Unable to compute realized P&L for closing leg %s", leg.product_id)
+            return
+        self._realized_pnl += self._calculate_realized_pnl_from_close(leg, quote)
+
+    async def _get_active_short_option_legs(self) -> list:
+        legs = await self.exchange.parse_option_positions()
+        return [leg for leg in legs if leg.size < 0]
+
     async def _close_short_straddle(self, straddle: ShortStraddle) -> None:
         async with self._exit_lock:
             submitted_orders = []
@@ -176,7 +188,7 @@ class StrategyEngine:
             await asyncio.sleep(0.1)
             LOGGER.info("Short straddle exit summary | submitted_orders=%s", submitted_orders)
 
-    async def _monitor_short_straddle(self, straddle: ShortStraddle) -> None:
+    async def _monitor_short_straddle(self, straddle: ShortStraddle) -> bool:
         profit_threshold = self.settings.profit_target
         loss_threshold = -self.settings.stop_loss
 
@@ -194,14 +206,14 @@ class StrategyEngine:
                 side="short",
             )
             if current_put is None and current_call is None:
-                return
+                return False
 
             if current_put is None or current_call is None:
                 # Do not perform a partial (single-leg) close here. Instead,
                 # perform a full strategy exit to ensure we only ever close
                 # all positions on overall strategy exit conditions.
                 await self._exit_strategy("stop_loss")
-                return
+                return True
 
             total_pnl = 0.0
             missing_prices = False
@@ -232,7 +244,7 @@ class StrategyEngine:
 
             if total_pnl >= profit_threshold or total_pnl <= loss_threshold:
                 await self._close_short_straddle(straddle)
-                return
+                return True
 
             await asyncio.sleep(self.settings.poll_interval_seconds)
 
@@ -268,7 +280,14 @@ class StrategyEngine:
 
         threshold = self.settings.strike_adjustment_threshold
         if current_index_price >= self._atm_reference_strike + threshold:
+            LOGGER.info(
+                "Straddle->strangle adjustment: index %.2f crossed upper threshold %.2f from reference %.2f",
+                current_index_price,
+                threshold,
+                self._atm_reference_strike,
+            )
             qty = abs(straddle.call_leg.size)
+            await self._record_realized_pnl_for_close(straddle.call_leg)
             await self.executor.execute_market_single_submission_with_fill_confirmation(
                 product_id=straddle.call_leg.product_id,
                 side="buy",
@@ -293,7 +312,14 @@ class StrategyEngine:
             return new_strike
 
         if current_index_price <= self._atm_reference_strike - threshold:
+            LOGGER.info(
+                "Straddle->strangle adjustment: index %.2f crossed lower threshold %.2f from reference %.2f",
+                current_index_price,
+                threshold,
+                self._atm_reference_strike,
+            )
             qty = abs(straddle.put_leg.size)
+            await self._record_realized_pnl_for_close(straddle.put_leg)
             await self.executor.execute_market_single_submission_with_fill_confirmation(
                 product_id=straddle.put_leg.product_id,
                 side="buy",
@@ -322,6 +348,7 @@ class StrategyEngine:
     async def _convert_strangle_to_straddle(self, strangle: ShortStrangle, current_index_price: float) -> float:
         if current_index_price >= strangle.call_leg.strike:
             qty = abs(strangle.put_leg.size)
+            await self._record_realized_pnl_for_close(strangle.put_leg)
             await self.executor.execute_market_single_submission_with_fill_confirmation(
                 product_id=strangle.put_leg.product_id,
                 side="buy",
@@ -348,6 +375,7 @@ class StrategyEngine:
 
         if current_index_price <= strangle.put_leg.strike:
             qty = abs(strangle.call_leg.size)
+            await self._record_realized_pnl_for_close(strangle.call_leg)
             await self.executor.execute_market_single_submission_with_fill_confirmation(
                 product_id=strangle.call_leg.product_id,
                 side="buy",
@@ -482,6 +510,13 @@ class StrategyEngine:
             except Exception:
                 straddle = None
 
+            active_short_legs = await self._get_active_short_option_legs()
+            if len(active_short_legs) != 2:
+                LOGGER.warning(
+                    "Initial position reconciliation failed: expected 2 active short legs but found %d",
+                    len(active_short_legs),
+                )
+
             if self._is_valid_short_straddle(straddle):
                 if self._atm_reference_strike is None:
                     self._atm_reference_strike = float(straddle.put_leg.strike)
@@ -527,14 +562,30 @@ class StrategyEngine:
                     trigger_price=None,
                     trigger_pnl=None,
                 )
-                await self._monitor_short_straddle(straddle)
-                return True
+                if await self._monitor_short_straddle(straddle):
+                    return True
+                await asyncio.sleep(self.settings.poll_interval_seconds)
+                continue
 
             try:
                 strangle = await self.positions.detect_short_strangle(require_otm=False)
             except Exception:
                 strangle = None
             if self._is_valid_short_strangle(strangle):
+                if len(active_short_legs) != 2:
+                    LOGGER.warning(
+                        "Strangle reconciliation failed: expected 2 active short legs but found %d",
+                        len(active_short_legs),
+                    )
+                    self._set_strategy_state(
+                        action="monitoring dynamic adjustment",
+                        status="position mismatch",
+                        status_message="expected exactly two active short legs for the strategy",
+                        trigger_price=None,
+                        trigger_pnl=None,
+                    )
+                    await asyncio.sleep(self.settings.poll_interval_seconds)
+                    continue
                 self._current_structure = "strangle"
 
                 put_exists = await self.positions.find_open_option_leg(
@@ -607,7 +658,10 @@ class StrategyEngine:
             self._set_strategy_state(
                 action="waiting for short straddle",
                 status="initial position missing",
-                status_message="required initial short straddle position is missing",
+                status_message=(
+                    "required initial short straddle position is missing; "
+                    "expected one short call and one short put with same quantity and expiry"
+                ),
                 trigger_price=None,
                 trigger_pnl=None,
             )
