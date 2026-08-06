@@ -29,6 +29,10 @@ class StrategyState:
     current_structure: str = "unknown"
     threshold: Optional[float] = None
     last_transition: Optional[str] = None
+    combined_pnl: Optional[float] = None
+    profit_target: Optional[float] = None
+    stop_loss: Optional[float] = None
+    exit_reason: Optional[str] = None
 
 
 class StrategyEngine:
@@ -424,6 +428,7 @@ class StrategyEngine:
         await self._close_all_open_option_positions()
         await self._cancel_pending_orders()
         self.state.triggered = True
+        self.state.exit_reason = reason
         if reason == "profit":
             self._set_strategy_state(
                 action="completed",
@@ -444,51 +449,15 @@ class StrategyEngine:
     async def _check_strategy_exit_conditions(self) -> bool:
         _, _, combined_pnl = await self._calculate_strategy_pnl()
         self.state.trigger_pnl = combined_pnl
+        self.state.combined_pnl = combined_pnl
+        self.state.profit_target = self.settings.profit_target
+        self.state.stop_loss = self.settings.stop_loss
         if combined_pnl >= self.settings.profit_target:
             await self._exit_strategy("profit")
             return True
         if combined_pnl <= -self.settings.stop_loss:
             await self._exit_strategy("stop_loss")
             return True
-        return False
-
-    async def _monitor_short_strangle(self, strangle: ShortStrangle) -> bool:
-        if not self._is_valid_short_strangle(strangle):
-            return False
-
-        profit_threshold = self.settings.profit_target
-        loss_threshold = -self.settings.stop_loss
-
-        total_pnl = 0.0
-        for leg in (strangle.put_leg, strangle.call_leg):
-            current_leg = await self.positions.find_open_option_leg(
-                option_type=leg.option_type,
-                strike=leg.strike,
-                expiry=leg.expiry,
-                side="short",
-            )
-            if current_leg is None:
-                continue
-            try:
-                quote = await self.exchange.get_best_quote(current_leg.product_id)
-            except Exception:
-                return False
-
-            total_pnl += abs(current_leg.size) * current_leg.contract_value * (
-                current_leg.entry_price - quote.best_ask
-            )
-
-        if total_pnl >= profit_threshold or total_pnl <= loss_threshold:
-            await self._close_short_straddle(strangle)
-            self._set_strategy_state(
-                action="closing short strangle",
-                status="short strangle closed",
-                status_message="closed the short strangle",
-                trigger_price=None,
-                trigger_pnl=None,
-            )
-            return True
-
         return False
 
     async def _monitor_dynamic_straddle_strangle(self) -> bool:

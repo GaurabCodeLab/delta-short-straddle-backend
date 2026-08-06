@@ -160,6 +160,10 @@ def test_bot_manager_status_exposes_runtime_details():
     assert state["current_structure"] == "straddle"
     assert state["threshold"] == 1000.0
     assert state["last_transition"] == "straddle->strangle"
+    assert state["combined_pnl"] is None
+    assert state["profit_target"] is None
+    assert state["stop_loss"] is None
+    assert state["exit_reason"] is None
 
 
 @pytest.mark.asyncio
