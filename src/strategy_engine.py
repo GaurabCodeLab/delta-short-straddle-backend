@@ -502,7 +502,7 @@ class StrategyEngine:
                 LOGGER.warning("Unable to fetch BTC index price during dynamic adjustment monitoring: %s", exc)
                 await asyncio.sleep(self.settings.poll_interval_seconds)
                 continue
-
+            print("ye call hua hai jee")
             self.state.last_index_price = index_price
             LOGGER.info(
                 "Dynamic adjustment loop: index_price=%.2f reference_strike=%s current_structure=%s",
