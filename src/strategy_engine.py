@@ -528,6 +528,10 @@ class StrategyEngine:
             if self._is_valid_short_straddle(straddle):
                 if self._atm_reference_strike is None:
                     self._atm_reference_strike = float(straddle.put_leg.strike)
+                self.state.previous_index_price = prev_index_price
+                self.state.reference_strike = self._atm_reference_strike
+                self.state.current_structure = "straddle"
+                self.state.threshold = self.settings.strike_adjustment_threshold
                 LOGGER.info(
                     "Detected short straddle with reference strike %.2f and threshold %.2f",
                     self._atm_reference_strike,
@@ -587,8 +591,6 @@ class StrategyEngine:
                     trigger_price=None,
                     trigger_pnl=None,
                 )
-                if await self._monitor_short_straddle(straddle):
-                    return True
                 await asyncio.sleep(self.settings.poll_interval_seconds)
                 continue
 
@@ -597,6 +599,10 @@ class StrategyEngine:
             except Exception:
                 strangle = None
             if self._is_valid_short_strangle(strangle):
+                self.state.previous_index_price = prev_index_price
+                self.state.reference_strike = None
+                self.state.current_structure = "strangle"
+                self.state.threshold = self.settings.strike_adjustment_threshold
                 if len(active_short_legs) != 2:
                     LOGGER.warning(
                         "Strangle reconciliation failed: expected 2 active short legs but found %d",
@@ -684,8 +690,6 @@ class StrategyEngine:
                     trigger_price=None,
                     trigger_pnl=None,
                 )
-                if await self._monitor_short_strangle(strangle):
-                    return True
                 await asyncio.sleep(self.settings.poll_interval_seconds)
                 continue
 

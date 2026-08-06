@@ -184,6 +184,68 @@ async def test_monitor_dynamic_straddle_strangle_keeps_monitoring_until_threshol
 
 
 @pytest.mark.asyncio
+async def test_monitor_dynamic_straddle_strangle_checks_threshold_without_blocking_on_straddle_monitor(settings):
+    class SequenceExchange(DummyExchange):
+        def __init__(self, values):
+            super().__init__()
+            self._values = iter(values)
+
+        async def get_index_price(self, symbol: str = "BTCUSD") -> float:
+            try:
+                return next(self._values)
+            except StopIteration:
+                return 65000.0
+
+    class DummyPositions:
+        def __init__(self, straddle):
+            self._straddle = straddle
+
+        async def detect_short_straddle(self):
+            return self._straddle
+
+        async def get_option_product_for_strike(self, **kwargs):
+            return {"id": 99}
+
+        async def find_open_option_leg(self, **kwargs):
+            return None
+
+    straddle = ShortStraddle(
+        put_leg=make_option_leg(1, "P-64000", "put", 64000.0, -1, 100.0),
+        call_leg=make_option_leg(2, "C-64000", "call", 64000.0, -1, 100.0),
+    )
+    exchange = SequenceExchange([64000.0, 65000.0])
+    positions = DummyPositions(straddle)
+    executor = DummyOrderExecutor(exchange)
+    engine = StrategyEngine(exchange=exchange, positions=positions, executor=executor, settings=settings)
+
+    converted = []
+
+    async def fake_monitor_short_straddle(_straddle):
+        await asyncio.sleep(10)
+        return False
+
+    async def fake_convert(_straddle, price):
+        converted.append(price)
+        return price
+
+    async def fake_check_exit_conditions():
+        return bool(converted)
+
+    async def fake_get_active_short_option_legs():
+        return [object(), object()]
+
+    engine._monitor_short_straddle = fake_monitor_short_straddle
+    engine._convert_straddle_to_strangle = fake_convert
+    engine._check_strategy_exit_conditions = fake_check_exit_conditions
+    engine._get_active_short_option_legs = fake_get_active_short_option_legs
+
+    result = await asyncio.wait_for(engine._monitor_dynamic_straddle_strangle(), timeout=0.5)
+
+    assert result is True
+    assert converted == [65000.0]
+
+
+@pytest.mark.asyncio
 async def test_premium_capture_and_profit_threshold(settings):
     exchange = DummyExchange()
     positions = PositionManager(exchange)
