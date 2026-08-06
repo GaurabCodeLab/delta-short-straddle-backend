@@ -140,7 +140,7 @@ class PositionManager:
             for call_leg in calls:
                 same_strike = math.isclose(put_leg.strike, call_leg.strike, rel_tol=1e-3)
                 same_expiry = put_leg.expiry.date() == call_leg.expiry.date()
-                same_qty = math.isclose(abs(put_leg.size), abs(call_leg.size), rel_tol=0, abs_tol=1e-8)
+                same_qty = math.isclose(abs(put_leg.size), abs(call_leg.size), rel_tol=0, abs_tol=5e-4)
                 if same_strike and same_expiry and same_qty:
                     return ShortStraddle(put_leg=put_leg, call_leg=call_leg)
 
@@ -168,7 +168,7 @@ class PositionManager:
         for put_leg in puts:
             for call_leg in calls:
                 same_expiry = put_leg.expiry.date() == call_leg.expiry.date()
-                same_qty = math.isclose(abs(put_leg.size), abs(call_leg.size), rel_tol=0, abs_tol=1e-8)
+                same_qty = math.isclose(abs(put_leg.size), abs(call_leg.size), rel_tol=0, abs_tol=5e-4)
                 if not same_expiry or not same_qty:
                     continue
 

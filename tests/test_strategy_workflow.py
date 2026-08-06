@@ -249,6 +249,32 @@ async def test_get_active_short_option_legs_returns_only_short_positions(setting
 
 
 @pytest.mark.asyncio
+async def test_detect_short_straddle_accepts_small_quantity_tolerance(settings):
+    exchange = DummyExchange()
+    exchange._positions = [
+        make_option_leg(1, "P-64000", "put", 64000.0, -1.0, 100.0),
+        make_option_leg(2, "C-64000", "call", 64000.0, -0.9999, 100.0),
+    ]
+    positions = PositionManager(exchange)
+
+    straddle = await positions.detect_short_straddle()
+
+    assert straddle is not None
+    assert straddle.put_leg.product_id == 1
+    assert straddle.call_leg.product_id == 2
+
+
+@pytest.mark.asyncio
+async def test_is_valid_short_straddle_accepts_small_quantity_tolerance(settings):
+    straddle = ShortStraddle(
+        put_leg=make_option_leg(1, "P-64000", "put", 64000.0, -1.0, 100.0),
+        call_leg=make_option_leg(2, "C-64000", "call", 64000.0, -0.9999, 100.0),
+    )
+
+    assert StrategyEngine._is_valid_short_straddle(straddle) is True
+
+
+@pytest.mark.asyncio
 async def test_convert_straddle_to_strangle_uses_reference_strike_and_same_qty(settings, monkeypatch):
     exchange = DummyExchange()
     positions = PositionManager(exchange)

@@ -75,7 +75,7 @@ class StrategyEngine:
             return False
         if straddle.put_leg.size >= 0 or straddle.call_leg.size >= 0:
             return False
-        if not math.isclose(abs(straddle.put_leg.size), abs(straddle.call_leg.size), rel_tol=0, abs_tol=1e-8):
+        if not math.isclose(abs(straddle.put_leg.size), abs(straddle.call_leg.size), rel_tol=0, abs_tol=5e-4):
             return False
         return math.isclose(straddle.put_leg.strike, straddle.call_leg.strike, rel_tol=0, abs_tol=1e-8)
 
@@ -93,7 +93,7 @@ class StrategyEngine:
             return False
         if math.isclose(strangle.put_leg.strike, strangle.call_leg.strike, rel_tol=0, abs_tol=1e-8):
             return False
-        if not math.isclose(abs(strangle.put_leg.size), abs(strangle.call_leg.size), rel_tol=0, abs_tol=1e-8):
+        if not math.isclose(abs(strangle.put_leg.size), abs(strangle.call_leg.size), rel_tol=0, abs_tol=5e-4):
             return False
         return True
 
@@ -504,6 +504,12 @@ class StrategyEngine:
                 continue
 
             self.state.last_index_price = index_price
+            LOGGER.info(
+                "Dynamic adjustment loop: index_price=%.2f reference_strike=%s current_structure=%s",
+                index_price,
+                self._atm_reference_strike,
+                self._current_structure,
+            )
 
             try:
                 straddle = await self.positions.detect_short_straddle()
@@ -520,6 +526,11 @@ class StrategyEngine:
             if self._is_valid_short_straddle(straddle):
                 if self._atm_reference_strike is None:
                     self._atm_reference_strike = float(straddle.put_leg.strike)
+                LOGGER.info(
+                    "Detected short straddle with reference strike %.2f and threshold %.2f",
+                    self._atm_reference_strike,
+                    self.settings.strike_adjustment_threshold,
+                )
                 self._current_structure = "straddle"
                 if index_price >= self._atm_reference_strike + self.settings.strike_adjustment_threshold:
                     LOGGER.info(
