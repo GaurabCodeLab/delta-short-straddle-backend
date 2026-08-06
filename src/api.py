@@ -163,6 +163,11 @@ class BotManager:
         strategy_state = {
             "triggered": self.strategy.state.triggered,
             "last_index_price": self.strategy.state.last_index_price,
+            "previous_index_price": self.strategy.state.previous_index_price,
+            "reference_strike": self.strategy.state.reference_strike,
+            "current_structure": self.strategy.state.current_structure,
+            "threshold": self.strategy.state.threshold,
+            "last_transition": self.strategy.state.last_transition,
             "status_message": self.strategy.state.status_message,
             "action": self.strategy.state.action,
             "status": self.strategy.state.status,

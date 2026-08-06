@@ -143,6 +143,25 @@ async def test_bot_manager_start_already_running_behavior():
     await asyncio.sleep(0)
 
 
+def test_bot_manager_status_exposes_runtime_details():
+    strategy = DummyStrategy()
+    strategy.state.last_index_price = 65000.0
+    strategy.state.previous_index_price = 64000.0
+    strategy.state.reference_strike = 64000.0
+    strategy.state.current_structure = "straddle"
+    strategy.state.threshold = 1000.0
+    strategy.state.last_transition = "straddle->strangle"
+    manager = BotManager(strategy)
+
+    state = manager.status()["strategy_state"]
+    assert state["last_index_price"] == 65000.0
+    assert state["previous_index_price"] == 64000.0
+    assert state["reference_strike"] == 64000.0
+    assert state["current_structure"] == "straddle"
+    assert state["threshold"] == 1000.0
+    assert state["last_transition"] == "straddle->strangle"
+
+
 @pytest.mark.asyncio
 async def test_bot_manager_collect_summary_aggregates_positions():
     class StrategyWithState:

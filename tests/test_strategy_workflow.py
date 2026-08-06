@@ -109,6 +109,16 @@ def settings():
     )
 
 
+def test_crossed_or_touched_does_not_trigger_on_initial_observation(settings):
+    exchange = DummyExchange()
+    positions = PositionManager(exchange)
+    executor = DummyOrderExecutor(exchange)
+    engine = StrategyEngine(exchange, positions, executor, settings)
+
+    assert not engine._crossed_or_touched(None, 65000.0, 64000.0, "put")
+    assert not engine._crossed_or_touched(None, 65000.0, 64000.0, "call")
+
+
 def test_apply_clock_skew_from_error_updates_offset():
     client = DeltaExchangeClient(
         api_key="key",
@@ -644,12 +654,10 @@ async def test_short_straddle_monitor_exits_on_loss_target(settings):
 
 
 def test_crossed_or_touched_various_cases():
-    assert StrategyEngine._crossed_or_touched(None, 29900.0, 30000.0, "put") is True
-    assert StrategyEngine._crossed_or_touched(None, 30100.0, 30000.0, "call") is True
+    assert StrategyEngine._crossed_or_touched(30100.0, 30000.0, 30000.0, "put") is True
+    assert StrategyEngine._crossed_or_touched(29900.0, 30000.0, 30000.0, "call") is True
     assert StrategyEngine._crossed_or_touched(30100.0, 29900.0, 30000.0, "put") is True
     assert StrategyEngine._crossed_or_touched(29900.0, 30100.0, 30000.0, "call") is True
-    assert StrategyEngine._crossed_or_touched(29900.0, 29950.0, 30000.0, "put") is True
-    assert StrategyEngine._crossed_or_touched(30100.0, 30000.0, 30000.0, "call") is True
 
 
 def test_crossed_or_touched_false_cases():
@@ -657,6 +665,7 @@ def test_crossed_or_touched_false_cases():
     assert StrategyEngine._crossed_or_touched(None, 29900.0, 30000.0, "call") is False
     assert StrategyEngine._crossed_or_touched(29900.0, 29950.0, 30000.0, "call") is False
     assert StrategyEngine._crossed_or_touched(30100.0, 30050.0, 30000.0, "put") is False
+    assert StrategyEngine._crossed_or_touched(30050.0, 30100.0, 30000.0, "put") is False
 
 
 @pytest.mark.asyncio

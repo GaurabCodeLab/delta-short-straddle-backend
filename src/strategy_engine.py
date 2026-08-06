@@ -24,6 +24,11 @@ class StrategyState:
     status: str = "initializing"
     trigger_price: Optional[str] = None
     trigger_pnl: Optional[float] = None
+    previous_index_price: Optional[float] = None
+    reference_strike: Optional[float] = None
+    current_structure: str = "unknown"
+    threshold: Optional[float] = None
+    last_transition: Optional[str] = None
 
 
 class StrategyEngine:
@@ -255,23 +260,19 @@ class StrategyEngine:
         strike: float,
         option_type: str = "",
     ) -> bool:
-        if curr_price == strike:
+        if math.isclose(curr_price, strike, rel_tol=0, abs_tol=1e-8):
             return True
+
         if prev_price is None:
-            # Market may already be past the strike when position is first detected.
-            # Trigger immediately if price is already on the "in-the-money" side.
-            opt = option_type.lower()
-            if opt == "put":
-                return curr_price <= strike
-            if opt == "call":
-                return curr_price >= strike
+            # Only treat a touch/crossing as a trigger when the market has
+            # actually moved and crossed the strike from the opposite side.
             return False
 
         opt = option_type.lower()
         if opt == "put":
-            return (prev_price>strike and curr_price<=strike) or (curr_price <= strike)
+            return prev_price > strike and curr_price <= strike
         if opt == "call":
-            return (prev_price<strike and curr_price>=strike) or (curr_price >= strike)
+            return prev_price < strike and curr_price >= strike
         return False
 
     async def _convert_straddle_to_strangle(self, straddle: ShortStraddle, current_index_price: float) -> float:
@@ -502,11 +503,12 @@ class StrategyEngine:
                 LOGGER.warning("Unable to fetch BTC index price during dynamic adjustment monitoring: %s", exc)
                 await asyncio.sleep(self.settings.poll_interval_seconds)
                 continue
-            print("ye call hua hai jee")
+            prev_index_price = self.state.last_index_price
             self.state.last_index_price = index_price
             LOGGER.info(
-                "Dynamic adjustment loop: index_price=%.2f reference_strike=%s current_structure=%s",
+                "Dynamic adjustment loop: index_price=%.2f previous_index_price=%s reference_strike=%s current_structure=%s",
                 index_price,
+                prev_index_price,
                 self._atm_reference_strike,
                 self._current_structure,
             )
@@ -534,8 +536,9 @@ class StrategyEngine:
                 self._current_structure = "straddle"
                 if index_price >= self._atm_reference_strike + self.settings.strike_adjustment_threshold:
                     LOGGER.info(
-                        "Dynamic straddle->strangle adjustment triggered at index %.2f using reference %.2f",
+                        "Dynamic straddle->strangle adjustment triggered at index %.2f (previous %.2f) using reference %.2f",
                         index_price,
+                        prev_index_price,
                         self._atm_reference_strike,
                     )
                     await self._convert_straddle_to_strangle(straddle, index_price)
@@ -551,11 +554,17 @@ class StrategyEngine:
 
                 if index_price <= self._atm_reference_strike - self.settings.strike_adjustment_threshold:
                     LOGGER.info(
-                        "Dynamic straddle->strangle adjustment triggered at index %.2f using reference %.2f",
+                        "Dynamic straddle->strangle adjustment triggered at index %.2f (previous %.2f) using reference %.2f",
                         index_price,
+                        prev_index_price,
                         self._atm_reference_strike,
                     )
                     await self._convert_straddle_to_strangle(straddle, index_price)
+                    self.state.previous_index_price = prev_index_price
+                    self.state.reference_strike = self._atm_reference_strike
+                    self.state.current_structure = self._current_structure
+                    self.state.threshold = self.settings.strike_adjustment_threshold
+                    self.state.last_transition = "straddle->strangle"
                     self._set_strategy_state(
                         action="adjusting short straddle",
                         status="strangle formed",
@@ -566,6 +575,11 @@ class StrategyEngine:
                     await asyncio.sleep(self.settings.poll_interval_seconds)
                     continue
 
+                LOGGER.info(
+                    "Monitoring short straddle: waiting for threshold crossing at index %.2f from reference %.2f",
+                    index_price,
+                    self._atm_reference_strike,
+                )
                 self._set_strategy_state(
                     action="monitoring short straddle",
                     status="waiting for reference drift",
@@ -622,25 +636,31 @@ class StrategyEngine:
                     return True
 
                 triggered_put = self._crossed_or_touched(
-                    self.state.last_index_price,
+                    prev_index_price,
                     index_price,
                     strangle.put_leg.strike,
                     "put",
                 )
                 triggered_call = self._crossed_or_touched(
-                    self.state.last_index_price,
+                    prev_index_price,
                     index_price,
                     strangle.call_leg.strike,
                     "call",
                 )
                 if triggered_put or triggered_call:
                     LOGGER.info(
-                        "Dynamic strangle->straddle adjustment triggered at index %.2f put_strike=%.2f call_strike=%.2f",
+                        "Dynamic strangle->straddle adjustment triggered at index %.2f (previous %.2f) put_strike=%.2f call_strike=%.2f",
                         index_price,
+                        prev_index_price,
                         strangle.put_leg.strike,
                         strangle.call_leg.strike,
                     )
                     await self._convert_strangle_to_straddle(strangle, index_price)
+                    self.state.previous_index_price = prev_index_price
+                    self.state.reference_strike = self._atm_reference_strike
+                    self.state.current_structure = self._current_structure
+                    self.state.threshold = self.settings.strike_adjustment_threshold
+                    self.state.last_transition = "strangle->straddle"
                     self._set_strategy_state(
                         action="adjusting short strangle",
                         status="straddle formed",
@@ -651,6 +671,12 @@ class StrategyEngine:
                     await asyncio.sleep(self.settings.poll_interval_seconds)
                     continue
 
+                LOGGER.info(
+                    "Monitoring short strangle: waiting for strike touch at index %.2f put_strike=%.2f call_strike=%.2f",
+                    index_price,
+                    strangle.put_leg.strike,
+                    strangle.call_leg.strike,
+                )
                 self._set_strategy_state(
                     action="monitoring short strangle",
                     status="waiting for strike touch",
