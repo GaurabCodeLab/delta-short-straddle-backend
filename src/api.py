@@ -68,12 +68,15 @@ class BotManager:
         self.strategy = strategy
         self._task: asyncio.Task | None = None
         self._lock = Lock()
+        self._logger = logging.getLogger(__name__)
 
     def start(self) -> dict[str, Any]:
         with self._lock:
             if self._task is not None and not self._task.done():
+                self._logger.info("Bot start requested but bot is already running")
                 return {"status": "already_running", "running": True}
             self._task = asyncio.create_task(self.strategy.run())
+            self._logger.info("Bot start requested and strategy launched")
             return {"status": "started", "running": True}
 
     async def collect_summary(self) -> dict[str, Any]:
@@ -153,8 +156,10 @@ class BotManager:
     def stop(self) -> dict[str, Any]:
         with self._lock:
             if self._task is None or self._task.done():
+                self._logger.info("Bot stop requested but bot was not running")
                 return {"status": "not_running", "running": False}
             self._task.cancel()
+            self._logger.info("Bot stop requested and strategy task canceled")
             return {"status": "stopped", "running": False}
 
     def status(self) -> dict[str, Any]:
@@ -203,9 +208,11 @@ def build_strategy() -> StrategyEngine:
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     setup_logging("INFO")
+    logging.getLogger().addHandler(log_handler)
     logging.getLogger(__name__).info("Delta BTC Options API starting")
     yield
     logging.getLogger(__name__).info("Delta BTC Options API shutting down")
+    logging.getLogger().removeHandler(log_handler)
     manager.stop()
 
 
@@ -221,7 +228,6 @@ app.add_middleware(
 )
 
 log_handler = JsonLogHandler(max_records=2000)
-logging.getLogger().addHandler(log_handler)
 
 strategy = build_strategy()
 manager = BotManager(strategy)
@@ -234,32 +240,39 @@ async def health() -> dict[str, str]:
 
 @app.post("/start")
 async def api_start() -> dict[str, Any]:
+    logging.getLogger(__name__).info("API /start called")
     return manager.start()
 
 
 @app.post("/stop")
 async def api_stop() -> dict[str, Any]:
+    logging.getLogger(__name__).info("API /stop called")
     return manager.stop()
 
 
 @app.get("/status")
 async def api_status() -> dict[str, Any]:
+    logging.getLogger(__name__).info("API /status called")
     return manager.status()
 
 
 @app.get("/summary")
 async def api_summary() -> dict[str, Any]:
     logger = logging.getLogger(__name__)
+    logger.info("API /summary called")
     try:
         return await manager.collect_summary()
     except Exception as exc:
         logger.exception("Summary API error")
         raise HTTPException(
-            status_code=500, 
+            status_code=500,
             detail=f"Failed to collect summary: {str(exc)}"
         )
 
 
 @app.get("/logs")
 async def api_logs(limit: int | None = None) -> dict[str, Any]:
-    return {"count": len(log_handler.latest(limit)), "logs": log_handler.latest(limit)}
+    logger = logging.getLogger(__name__)
+    logger.info("API /logs called with limit=%s", limit)
+    latest_logs = log_handler.latest(limit)
+    return {"count": len(latest_logs), "logs": latest_logs}
