@@ -162,6 +162,11 @@ class BotManager:
             self._logger.info("Bot stop requested and strategy task canceled")
             return {"status": "stopped", "running": False}
 
+    async def refresh_live_state(self) -> None:
+        refresh = getattr(self.strategy, "refresh_live_state", None)
+        if callable(refresh):
+            await refresh()
+
     def status(self) -> dict[str, Any]:
         with self._lock:
             running = self._task is not None and not self._task.done()
@@ -253,6 +258,7 @@ async def api_stop() -> dict[str, Any]:
 @app.get("/status")
 async def api_status() -> dict[str, Any]:
     logging.getLogger(__name__).info("API /status called")
+    await manager.refresh_live_state()
     return manager.status()
 
 
@@ -261,6 +267,7 @@ async def api_summary() -> dict[str, Any]:
     logger = logging.getLogger(__name__)
     logger.info("API /summary called")
     try:
+        await manager.refresh_live_state()
         return await manager.collect_summary()
     except Exception as exc:
         logger.exception("Summary API error")

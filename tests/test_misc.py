@@ -167,6 +167,31 @@ def test_bot_manager_status_exposes_runtime_details():
 
 
 @pytest.mark.asyncio
+async def test_api_status_refreshes_live_combined_pnl_state():
+    class RefreshableStrategy(DummyStrategy):
+        def __init__(self) -> None:
+            super().__init__()
+            self.state = StrategyState()
+            self.state.combined_pnl = 0.0
+            self.state.profit_target = 10.0
+            self.state.stop_loss = 20.0
+
+        async def refresh_live_state(self) -> None:
+            self.state.combined_pnl = 123.45
+            self.state.profit_target = 50.0
+            self.state.stop_loss = 100.0
+
+    strategy = RefreshableStrategy()
+    manager = BotManager(strategy)
+    await manager.refresh_live_state()
+    payload = manager.status()
+
+    assert payload["strategy_state"]["combined_pnl"] == pytest.approx(123.45)
+    assert payload["strategy_state"]["profit_target"] == pytest.approx(50.0)
+    assert payload["strategy_state"]["stop_loss"] == pytest.approx(100.0)
+
+
+@pytest.mark.asyncio
 async def test_bot_manager_collect_summary_aggregates_positions():
     class StrategyWithState:
         def __init__(self) -> None:

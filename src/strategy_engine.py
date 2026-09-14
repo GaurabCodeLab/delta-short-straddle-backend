@@ -446,12 +446,18 @@ class StrategyEngine:
                 trigger_pnl=self.state.trigger_pnl,
             )
 
-    async def _check_strategy_exit_conditions(self) -> bool:
+    async def refresh_live_state(self) -> None:
         _, _, combined_pnl = await self._calculate_strategy_pnl()
         self.state.trigger_pnl = combined_pnl
         self.state.combined_pnl = combined_pnl
         self.state.profit_target = self.settings.profit_target
         self.state.stop_loss = self.settings.stop_loss
+
+    async def _check_strategy_exit_conditions(self) -> bool:
+        await self.refresh_live_state()
+        combined_pnl = self.state.combined_pnl
+        if combined_pnl is None:
+            return False
         if combined_pnl >= self.settings.profit_target:
             await self._exit_strategy("profit")
             return True
