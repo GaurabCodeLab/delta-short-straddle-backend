@@ -85,6 +85,26 @@ class DummyOrderExecutor(OrderExecutor):
         return size
 
 
+def test_load_settings_rejects_non_positive_poll_interval(monkeypatch):
+    monkeypatch.setenv("DELTA_API_KEY", "key")
+    monkeypatch.setenv("DELTA_API_SECRET", "secret")
+
+    monkeypatch.setenv("POLL_INTERVAL_SECONDS", "0")
+    with pytest.raises(ValueError, match="POLL_INTERVAL_SECONDS"):
+        from src.config import load_settings
+        load_settings()
+
+    monkeypatch.setenv("POLL_INTERVAL_SECONDS", "-1")
+    with pytest.raises(ValueError, match="POLL_INTERVAL_SECONDS"):
+        from src.config import load_settings
+        load_settings()
+
+    monkeypatch.setenv("POLL_INTERVAL_SECONDS", "nan")
+    with pytest.raises(ValueError, match="POLL_INTERVAL_SECONDS"):
+        from src.config import load_settings
+        load_settings()
+
+
 def test_json_log_handler_parses_json_data():
     handler = JsonLogHandler(max_records=3)
     logger = logging.getLogger("test_json_log_handler")
