@@ -36,6 +36,30 @@ async def test_get_products_raw_pagination_and_dedup():
 
 
 @pytest.mark.asyncio
+async def test_get_products_raw_stops_on_duplicate_and_failed_pages():
+    calls = [
+        {"success": True, "result": [{"id": 1}]},
+        {"success": True, "result": [{"id": 1}]},
+        {"success": False, "result": []},
+    ]
+
+    async def _call(method_name, **kwargs):
+        payload = calls.pop(0)
+
+        def json():
+            return payload
+
+        return SimpleNamespace(json=json)
+
+    client = SimpleNamespace()
+    client._call = _call
+    client.get_products_raw = DeltaExchangeClient.get_products_raw.__get__(client, client.__class__)
+
+    products = await client.get_products_raw()
+    assert [p["id"] for p in products] == [1]
+
+
+@pytest.mark.asyncio
 async def test_place_market_order_and_get_order_success_and_failure():
     # place_market_order expects self._order_type_market and _tif_ioc exist
     async def _call_place(method_name, **kwargs):

@@ -53,6 +53,7 @@ class StrategyEngine:
         self._atm_reference_strike: Optional[float] = None
         self._current_structure: str = "unknown"
         self._realized_pnl = 0.0
+        self.closed_positions: list[dict] = []
 
     def _set_status(self, message: str) -> None:
         self.state.status_message = message
@@ -116,6 +117,13 @@ class StrategyEngine:
             return abs(leg.size) * leg.contract_value * (quote.best_bid - leg.entry_price)
         return abs(leg.size) * leg.contract_value * (leg.entry_price - quote.best_ask)
 
+    @staticmethod
+    def _calculate_realized_pnl_from_fill_price(leg, fill_price: float, filled_qty: float | None = None) -> float:
+        qty = abs(leg.size) if filled_qty is None else float(filled_qty)
+        if leg.size > 0:
+            return qty * leg.contract_value * (fill_price - leg.entry_price)
+        return qty * leg.contract_value * (leg.entry_price - fill_price)
+
     async def _cancel_pending_orders(self) -> None:
         cancel_orders = getattr(self.exchange, "cancel_all_orders", None)
         if callable(cancel_orders):
@@ -137,25 +145,51 @@ class StrategyEngine:
             if size <= 0:
                 continue
             side = "buy" if leg.size < 0 else "sell"
-            try:
-                quote = await self.exchange.get_best_quote(leg.product_id)
-                self._realized_pnl += self._calculate_realized_pnl_from_close(leg, quote)
-            except Exception:
-                LOGGER.debug("Unable to compute realized P&L for closing leg %s", leg.product_id)
             await self.executor.execute_market_single_submission_with_fill_confirmation(
                 product_id=leg.product_id,
                 side=side,
                 size=size,
                 reduce_only=True,
             )
+            await self._record_realized_pnl_for_close(leg)
 
     async def _record_realized_pnl_for_close(self, leg) -> None:
-        try:
-            quote = await self.exchange.get_best_quote(leg.product_id)
-        except Exception:
-            LOGGER.debug("Unable to compute realized P&L for closing leg %s", leg.product_id)
-            return
-        self._realized_pnl += self._calculate_realized_pnl_from_close(leg, quote)
+        realized_pnl = 0.0
+        closed_price = None
+        filled_qty = abs(leg.size)
+
+        last_fill = getattr(self.executor, "last_fill_details", None)
+        if isinstance(last_fill, dict) and last_fill.get("product_id") == leg.product_id:
+            fill_price = last_fill.get("avg_fill_price")
+            if fill_price is not None:
+                filled_qty = last_fill.get("filled_qty", abs(leg.size))
+                realized_pnl = self._calculate_realized_pnl_from_fill_price(leg, float(fill_price), float(filled_qty))
+                closed_price = float(fill_price)
+
+        if realized_pnl == 0.0 and closed_price is None:
+            try:
+                quote = await self.exchange.get_best_quote(leg.product_id)
+            except Exception:
+                LOGGER.debug("Unable to compute realized P&L for closing leg %s", leg.product_id)
+                return
+            realized_pnl = self._calculate_realized_pnl_from_close(leg, quote)
+            closed_price = float(quote.best_ask if leg.size < 0 else quote.best_bid)
+
+        self._realized_pnl += realized_pnl
+        self.closed_positions.append(
+            {
+                "product_id": leg.product_id,
+                "symbol": leg.symbol,
+                "option_type": leg.option_type,
+                "strike": leg.strike,
+                "expiry": leg.expiry.isoformat() if leg.expiry is not None else None,
+                "side": "short" if leg.size < 0 else "long",
+                "size": float(filled_qty),
+                "entry_price": float(leg.entry_price),
+                "closed_price": closed_price,
+                "realized_pnl": float(realized_pnl),
+            }
+        )
 
     async def _get_active_short_option_legs(self) -> list:
         legs = await self.exchange.parse_option_positions()
@@ -175,17 +209,13 @@ class StrategyEngine:
                     continue
 
                 size = abs(current_leg.size)
-                try:
-                    quote = await self.exchange.get_best_quote(current_leg.product_id)
-                    self._realized_pnl += self._calculate_realized_pnl_from_close(current_leg, quote)
-                except Exception:
-                    LOGGER.debug("Unable to compute realized P&L for closing leg %s", current_leg.product_id)
                 filled = await self.executor.execute_market_single_submission_with_fill_confirmation(
                     product_id=current_leg.product_id,
                     side="buy",
                     size=size,
                     reduce_only=True,
                 )
+                await self._record_realized_pnl_for_close(current_leg)
                 submitted_orders.append(
                     {
                         "product_id": current_leg.product_id,

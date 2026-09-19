@@ -82,21 +82,21 @@ class BotManager:
     async def collect_summary(self) -> dict[str, Any]:
         exchange = self.strategy.exchange
         logger = logging.getLogger(__name__)
-        
+
         try:
             index_price = await exchange.get_index_price("BTCUSDT")
             logger.info(f"Index price fetched: {index_price}")
         except Exception as e:
             logger.error(f"Failed to fetch index price: {str(e)}")
             raise
-        
+
         try:
             legs = await exchange.parse_option_positions()
             logger.info(f"Parsed {len(legs)} option positions")
         except Exception as e:
             logger.error(f"Failed to parse option positions: {str(e)}")
             raise
-        
+
         total_pnl = 0.0
         positions: list[dict[str, Any]] = []
 
@@ -108,18 +108,18 @@ class BotManager:
                     timeout=4.0
                 )
                 qty = abs(leg.size)
-                
+
                 # Validate quote data before calculations
                 if quote.best_bid is None or quote.best_ask is None:
                     logger.warning(f"Invalid quote for product {leg.product_id}: bid={quote.best_bid}, ask={quote.best_ask}")
                     continue
-                
+
                 # Calculate PnL safely
                 if leg.size > 0:
                     pnl = qty * leg.contract_value * (float(quote.best_bid) - float(leg.entry_price))
                 else:
                     pnl = qty * leg.contract_value * (float(leg.entry_price) - float(quote.best_ask))
-                
+
                 total_pnl += pnl
                 positions.append(
                     {
@@ -143,13 +143,46 @@ class BotManager:
                 logger.error(f"Error processing position for product {leg.product_id}: {str(e)}")
                 continue
 
-        logger.info(f"Summary collected: {len(positions)} positions, total_pnl={total_pnl}")
-        
+        closed_positions = getattr(self.strategy, "closed_positions", None)
+        if closed_positions is None:
+            closed_positions = []
+        if not isinstance(closed_positions, list):
+            closed_positions = list(closed_positions)
+
+        normalized_closed = []
+        for entry in closed_positions:
+            normalized_closed.append(
+                {
+                    "product_id": entry.get("product_id"),
+                    "symbol": entry.get("symbol"),
+                    "option_type": entry.get("option_type"),
+                    "strike": entry.get("strike"),
+                    "expiry": entry.get("expiry"),
+                    "side": entry.get("side"),
+                    "size": entry.get("size"),
+                    "entry_price": entry.get("entry_price"),
+                    "closed_price": entry.get("closed_price"),
+                    "realized_pnl": entry.get("realized_pnl"),
+                }
+            )
+
+        realized_pnl = sum(float(entry.get("realized_pnl", 0.0) or 0.0) for entry in normalized_closed)
+        logger.info(
+            "Summary collected: %s open positions, %s closed positions, unrealized_pnl=%s realized_pnl=%s",
+            len(positions),
+            len(normalized_closed),
+            total_pnl,
+            realized_pnl,
+        )
+
         return {
             "index_price": index_price,
             "unrealized_pnl": total_pnl,
+            "realized_pnl": realized_pnl,
             "position_count": len(positions),
             "positions": positions,
+            "closed_positions": normalized_closed,
+            "closed_position_count": len(normalized_closed),
             "strategy_state": self.status()["strategy_state"],
         }
 

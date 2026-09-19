@@ -11,6 +11,7 @@ LOGGER = logging.getLogger(__name__)
 class OrderExecutor:
     def __init__(self, exchange: DeltaExchangeClient) -> None:
         self.exchange = exchange
+        self.last_fill_details: Dict[str, Any] | None = None
 
     @staticmethod
     def _extract_order_id(place_resp: Dict[str, Any]) -> str:
@@ -19,6 +20,49 @@ class OrderExecutor:
         if not order_id:
             raise RuntimeError(f"Cannot extract order id from response: {place_resp}")
         return str(order_id)
+
+    @staticmethod
+    def _extract_price_from_payload(payload: Any) -> float | None:
+        if not isinstance(payload, dict):
+            return None
+
+        candidates: list[Any] = []
+        for key in (
+            "avg_price",
+            "average_price",
+            "price",
+            "fill_price",
+            "last_fill_price",
+            "execution_price",
+            "avg_fill_price",
+            "filled_avg_price",
+        ):
+            if key in payload:
+                candidates.append(payload.get(key))
+
+        result = payload.get("result")
+        if isinstance(result, dict):
+            for key in (
+                "avg_price",
+                "average_price",
+                "price",
+                "fill_price",
+                "last_fill_price",
+                "execution_price",
+                "avg_fill_price",
+                "filled_avg_price",
+            ):
+                if key in result:
+                    candidates.append(result.get(key))
+
+        for value in candidates:
+            if value is None:
+                continue
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                continue
+        return None
 
     async def execute_market_single_submission_with_fill_confirmation(
         self,
@@ -41,6 +85,7 @@ class OrderExecutor:
             reduce_only,
         )
         pre_size = await self.exchange.get_position_size(product_id)
+        self.last_fill_details = None
 
         try:
             place_resp = await self.exchange.place_market_order(
@@ -56,6 +101,11 @@ class OrderExecutor:
                     product_id,
                     size,
                 )
+                self.last_fill_details = {
+                    "product_id": product_id,
+                    "filled_qty": float(size),
+                    "avg_fill_price": None,
+                }
                 return float(size)
             raise
 
@@ -66,11 +116,26 @@ class OrderExecutor:
         inferred = max(0.0, dir_sign * (post_size - pre_size))
         confirmed = min(size, inferred)
 
+        avg_fill_price = self._extract_price_from_payload(place_resp)
+        if avg_fill_price is None and hasattr(self.exchange, "get_order"):
+            try:
+                order_info = await self.exchange.get_order(order_id, product_id=product_id)
+                avg_fill_price = self._extract_price_from_payload(order_info)
+            except Exception:
+                avg_fill_price = None
+
+        self.last_fill_details = {
+            "product_id": product_id,
+            "filled_qty": float(confirmed),
+            "avg_fill_price": float(avg_fill_price) if avg_fill_price is not None else None,
+        }
+
         LOGGER.info(
-            "Single order reconciliation order_id=%s confirmed=%s requested=%s pre_size=%s",
+            "Single order reconciliation order_id=%s confirmed=%s requested=%s pre_size=%s avg_fill_price=%s",
             order_id,
             confirmed,
             size,
             pre_size,
+            avg_fill_price,
         )
         return confirmed

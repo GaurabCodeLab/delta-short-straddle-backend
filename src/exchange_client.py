@@ -130,8 +130,14 @@ class DeltaExchangeClient:
     async def get_open_positions_raw(self) -> List[Dict[str, Any]]:
         try:
             resp = await self._call("request", method="GET", path="/v2/positions/margined", auth=True)
-            payload = await asyncio.to_thread(resp.json)
+            payload = resp
+            if isinstance(resp, dict):
+                payload = resp
+            elif hasattr(resp, "json"):
+                payload = await asyncio.to_thread(resp.json)
             LOGGER.debug(f"Margined positions response: {payload}")
+            if not isinstance(payload, dict):
+                raise ExchangeClientError("Unexpected positions response shape")
             success = payload.get("success")
             if success is False:
                 last_error = payload.get("error") or payload.get("message")
@@ -147,6 +153,8 @@ class DeltaExchangeClient:
     async def get_position_size(self, product_id: int) -> float:
         """Return signed net position size for a product (positive long, negative short)."""
         positions = await self.get_open_positions_raw()
+        if not positions:
+            return 0.0
         for pos in positions:
             try:
                 product = pos.get("product") if isinstance(pos.get("product"), dict) else None
@@ -181,7 +189,13 @@ class DeltaExchangeClient:
                     break
                 resp = await self._call("request", method="GET", path="/v2/products", auth=True)
 
-            payload = await asyncio.to_thread(resp.json)
+            payload = resp
+            if isinstance(resp, dict):
+                payload = resp
+            elif hasattr(resp, "json"):
+                payload = await asyncio.to_thread(resp.json)
+            if not isinstance(payload, dict):
+                break
             if not payload.get("success"):
                 break
 
@@ -226,7 +240,13 @@ class DeltaExchangeClient:
                 query={"symbol": target},
                 auth=True,
             )
-            payload = await asyncio.to_thread(resp.json)
+            payload = resp
+            if isinstance(resp, dict):
+                payload = resp
+            elif hasattr(resp, "json"):
+                payload = await asyncio.to_thread(resp.json)
+            if not isinstance(payload, dict):
+                raise ExchangeClientError("Unexpected product lookup response shape")
             if payload.get("success"):
                 result = payload.get("result") or []
                 if isinstance(result, list):
@@ -256,7 +276,18 @@ class DeltaExchangeClient:
         try:
             data = await self._call("get_ticker", identifier=product_id, auth=True)
             LOGGER.debug(f"Quote method get_ticker for product {product_id}: {data}")
-            root = data.get("quotes", data) if isinstance(data, dict) else {}
+            if not isinstance(data, dict):
+                raise ExchangeClientError("Quote response missing best_bid or best_ask")
+
+            root = data.get("quotes") if isinstance(data.get("quotes"), dict) else data
+            if isinstance(root, dict):
+                if isinstance(root.get("result"), dict):
+                    root = root.get("result")
+                if isinstance(root.get("data"), dict):
+                    root = root.get("data")
+            else:
+                root = {}
+
             best_bid = root.get("best_bid")
             best_ask = root.get("best_ask")
             if best_bid is not None and best_ask is not None:

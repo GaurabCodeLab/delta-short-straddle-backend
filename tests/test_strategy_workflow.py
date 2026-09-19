@@ -500,6 +500,33 @@ async def test_strategy_exit_hits_stop_loss_when_combined_pnl_is_too_negative(se
     assert len(executor.executed) == 2
 
 
+@pytest.mark.asyncio
+async def test_end_to_end_strategy_exit_closes_all_legs_and_records_history(settings):
+    exchange = DummyExchange()
+    exchange._positions = [
+        make_option_leg(1, "P-30000", "put", 30000.0, -1.0, 100.0),
+        make_option_leg(2, "C-30000", "call", 30000.0, -1.0, 110.0),
+    ]
+    exchange._quotes = {
+        1: Quote(best_bid=1.0, best_ask=70.0),
+        2: Quote(best_bid=1.0, best_ask=80.0),
+    }
+
+    positions = PositionManager(exchange)
+    executor = DummyOrderExecutor(exchange)
+    engine = StrategyEngine(exchange, positions, executor, settings)
+    engine._realized_pnl = 60.0
+
+    exited = await engine._check_strategy_exit_conditions()
+
+    assert exited is True
+    assert engine.state.status == "Completed - Profit Target Reached"
+    assert len(executor.executed) == 2
+    assert len(engine.closed_positions) == 2
+    assert sum(item["realized_pnl"] for item in engine.closed_positions) == pytest.approx(60.0)
+    assert exchange._positions == []
+
+
 def test_delta_exchange_client_to_dt_parses_iso_string():
     parsed = DeltaExchangeClient._to_dt("2026-12-31T00:00:00Z")
     assert parsed.date().isoformat() == "2026-12-31"
@@ -652,6 +679,67 @@ async def test_order_executor_handles_reduce_only_no_position(settings):
         reduce_only=True,
     )
     assert confirmed == 5.0
+
+
+@pytest.mark.asyncio
+async def test_record_realized_pnl_prefers_execution_fill_price_over_quote(settings):
+    exchange = DummyExchange()
+    positions = PositionManager(exchange)
+    executor = DummyOrderExecutor(exchange)
+    executor.last_fill_details = {"product_id": 1, "filled_qty": 1.0, "avg_fill_price": 90.0}
+    engine = StrategyEngine(exchange, positions, executor, settings)
+    leg = make_option_leg(1, "P-30000", "put", 30000.0, -1.0, 100.0)
+    exchange._quotes[1] = Quote(best_bid=1.0, best_ask=120.0)
+
+    await engine._record_realized_pnl_for_close(leg)
+
+    assert engine._realized_pnl == pytest.approx(10.0)
+
+
+@pytest.mark.asyncio
+async def test_recorded_close_tracks_closed_position_history(settings):
+    exchange = DummyExchange()
+    positions = PositionManager(exchange)
+    executor = DummyOrderExecutor(exchange)
+    executor.last_fill_details = {"product_id": 1, "filled_qty": 1.0, "avg_fill_price": 90.0}
+    engine = StrategyEngine(exchange, positions, executor, settings)
+    leg = make_option_leg(1, "P-30000", "put", 30000.0, -1.0, 100.0)
+
+    await engine._record_realized_pnl_for_close(leg)
+
+    assert len(engine.closed_positions) == 1
+    assert engine.closed_positions[0]["closed_price"] == pytest.approx(90.0)
+    assert engine.closed_positions[0]["realized_pnl"] == pytest.approx(10.0)
+
+
+def test_realized_pnl_math_for_short_and_long_legs(settings):
+    exchange = DummyExchange()
+    positions = PositionManager(exchange)
+    executor = DummyOrderExecutor(exchange)
+    engine = StrategyEngine(exchange, positions, executor, settings)
+
+    short_leg = make_option_leg(1, "P-30000", "put", 30000.0, -1.0, 100.0)
+    long_leg = make_option_leg(2, "C-30000", "call", 30000.0, 1.0, 100.0)
+
+    assert engine._calculate_realized_pnl_from_fill_price(short_leg, 90.0) == pytest.approx(10.0)
+    assert engine._calculate_realized_pnl_from_fill_price(long_leg, 110.0) == pytest.approx(10.0)
+
+
+@pytest.mark.asyncio
+async def test_record_realized_pnl_falls_back_to_quote_when_fill_missing(settings):
+    exchange = DummyExchange()
+    positions = PositionManager(exchange)
+    executor = DummyOrderExecutor(exchange)
+    engine = StrategyEngine(exchange, positions, executor, settings)
+    leg = make_option_leg(1, "P-30000", "put", 30000.0, -1.0, 100.0)
+    exchange._quotes[1] = Quote(best_bid=95.0, best_ask=95.0)
+    executor.last_fill_details = {"product_id": 2, "filled_qty": 1.0, "avg_fill_price": 120.0}
+
+    await engine._record_realized_pnl_for_close(leg)
+
+    assert engine._realized_pnl == pytest.approx(5.0)
+    assert engine.closed_positions[-1]["closed_price"] == pytest.approx(95.0)
+    assert engine.closed_positions[-1]["realized_pnl"] == pytest.approx(5.0)
 
 
 @pytest.mark.asyncio

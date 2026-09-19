@@ -76,6 +76,31 @@ async def test_collect_summary_and_status():
     assert "strategy_state" in status
 
 
+@pytest.mark.asyncio
+async def test_collect_summary_includes_closed_positions_with_realized_pnl():
+    leg = make_leg(1, "call", 100.0, -1, entry_price=10.0)
+    exchange = FakeExchange(legs=[], quotes={}, index_price=123.45)
+    strategy = DummyStrategy(exchange)
+    strategy.closed_positions = [{
+        "product_id": 1,
+        "symbol": "OPT-1",
+        "option_type": "call",
+        "strike": 100.0,
+        "expiry": "2026-12-31T00:00:00+00:00",
+        "side": "short",
+        "size": 1.0,
+        "entry_price": 10.0,
+        "closed_price": 8.0,
+        "realized_pnl": 2.0,
+    }]
+    manager = BotManager(strategy)
+
+    summary = await manager.collect_summary()
+    assert summary["closed_positions"][0]["closed_price"] == 8.0
+    assert summary["closed_positions"][0]["realized_pnl"] == 2.0
+    assert summary["realized_pnl"] == 2.0
+
+
 def test_json_log_handler_emit_and_latest():
     handler = JsonLogHandler(max_records=5)
     logger = logging.getLogger("testlogger")
