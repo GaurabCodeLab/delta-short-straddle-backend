@@ -62,6 +62,25 @@ class DeltaExchangeClient:
                 raise ExchangeClientError(f"Unsupported datetime value: {value}") from exc
         raise ExchangeClientError(f"Unsupported datetime value: {value}")
 
+    @staticmethod
+    def _coerce_float(value: Any) -> float | None:
+        if value is None:
+            return None
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _unwrap_payload(payload: Any) -> Any:
+        if isinstance(payload, dict):
+            for key in ("result", "data", "payload"):
+                if key in payload:
+                    nested = DeltaExchangeClient._unwrap_payload(payload[key])
+                    if nested is not None:
+                        return nested
+        return payload
+
     @retry(
         stop=stop_after_attempt(4),
         wait=wait_exponential(multiplier=0.5, min=0.5, max=4),
@@ -81,51 +100,76 @@ class DeltaExchangeClient:
                 return await asyncio.to_thread(method)
             raise
 
+    @staticmethod
+    def _extract_price_value(payload: Any) -> float | None:
+        if payload is None:
+            return None
+        if isinstance(payload, (int, float)):
+            return float(payload)
+        if not isinstance(payload, dict):
+            return None
+
+        for key in ("spot_price", "last_price", "price"):
+            if key in payload and payload[key] is not None:
+                try:
+                    return float(payload[key])
+                except (TypeError, ValueError):
+                    continue
+
+        nested_candidates = [payload.get("result"), payload.get("data"), payload.get("ticker"), payload.get("quotes")]
+        for nested in nested_candidates:
+            value = DeltaExchangeClient._extract_price_value(nested)
+            if value is not None:
+                return value
+        return None
+
     async def get_index_price(self, symbol: str = "BTCUSDT") -> float:
-        try:
-            data = await self._call("get_ticker", **{"identifier": "BTCUSD", "auth": True})
-            if not isinstance(data, dict):
-                raise ExchangeClientError(
-                    "Unexpected ticker response format: response is not a dict"
-                )
+        candidates: list[str] = []
+        requested_symbol = (symbol or "").strip()
+        if requested_symbol:
+            candidates.append(requested_symbol)
+        if requested_symbol.upper() == "BTCUSDT":
+            candidates.extend(["BTCUSD", ".DEXBTUSD"])
+        elif requested_symbol.upper() == "BTCUSD":
+            candidates.extend(["BTCUSDT", ".DEXBTUSD"])
+        elif requested_symbol.upper() != ".DEXBTUSD":
+            candidates.append(".DEXBTUSD")
+        if not candidates:
+            candidates = ["BTCUSDT", "BTCUSD", ".DEXBTUSD"]
 
-            if data.get("success") is False:
-                error_text = data.get("error") or data.get("message") or data.get("result")
-                raise ExchangeClientError(
-                    f"Delta ticker endpoint returned error: {error_text}"
-                )
+        deduped: list[str] = []
+        seen: set[str] = set()
+        for candidate in candidates:
+            key = candidate.strip()
+            if key and key.upper() not in seen:
+                seen.add(key.upper())
+                deduped.append(key)
 
-            price = data.get("spot_price") or data.get("last_price")
-            if price is None:
-                result = data.get("result")
-                if isinstance(result, dict):
-                    nested = result.get("data")
-                    if isinstance(nested, dict):
-                        price = nested.get("last_price")
-                    else:
-                        price = result.get("last_price")
+        last_error: Exception | None = None
+        for candidate in deduped:
+            for call_kwargs in ({"identifier": candidate, "auth": True}, {"symbol": candidate, "auth": True}):
+                try:
+                    data = await self._call("get_ticker", **call_kwargs)
+                    if not isinstance(data, dict):
+                        raise ExchangeClientError("Unexpected ticker response format: response is not a dict")
 
-            if price is None:
-                ticker = data.get("ticker")
-                if isinstance(ticker, dict):
-                    price = ticker.get("spot_price") or ticker.get("last_price")
+                    if data.get("success") is False:
+                        error_text = data.get("error") or data.get("message") or data.get("result")
+                        raise ExchangeClientError(f"Delta ticker endpoint returned error: {error_text}")
 
-            if price is None and isinstance(data.get("result"), dict):
-                result = data["result"]
-                ticker = result.get("ticker")
-                if isinstance(ticker, dict):
-                    price = ticker.get("spot_price") or ticker.get("last_price")
+                    price = DeltaExchangeClient._extract_price_value(data)
+                    if price is None:
+                        raise ExchangeClientError(
+                            f"Quote response missing spot_price or last_price. Response={data}"
+                        )
+                    return float(price)
+                except Exception as exc:
+                    last_error = exc
+                    continue
 
-            if price is None:
-                raise ExchangeClientError(
-                    f"Quote response missing spot_price or last_price. Response={data}"
-                )
-
-            return float(price)
-        except Exception as exc:
-            raise ExchangeClientError(
-                "Unable to fetch BTC index price from client methods."
-            ) from exc
+        raise ExchangeClientError(
+            "Unable to fetch BTC index price from client methods."
+        ) from last_error
 
     async def get_open_positions_raw(self) -> List[Dict[str, Any]]:
         try:
@@ -136,6 +180,9 @@ class DeltaExchangeClient:
             elif hasattr(resp, "json"):
                 payload = await asyncio.to_thread(resp.json)
             LOGGER.debug(f"Margined positions response: {payload}")
+            payload = DeltaExchangeClient._unwrap_payload(payload)
+            if isinstance(payload, list):
+                return payload
             if not isinstance(payload, dict):
                 raise ExchangeClientError("Unexpected positions response shape")
             success = payload.get("success")
@@ -143,8 +190,10 @@ class DeltaExchangeClient:
                 last_error = payload.get("error") or payload.get("message")
                 LOGGER.debug(f"Unable to fetch open positions. Last error: {last_error}")
                 return None
-            result = payload.get("result") or []
-            return result
+            result = payload.get("result") or payload.get("positions") or []
+            if isinstance(result, dict):
+                result = result.get("data") or result.get("positions") or []
+            return result if isinstance(result, list) else []
         except Exception as exc:
             LOGGER.debug(f"Margined positions endpoint failed: {str(exc)}")
             last_error = str(exc)
@@ -156,15 +205,25 @@ class DeltaExchangeClient:
         if not positions:
             return 0.0
         for pos in positions:
+            if not isinstance(pos, dict):
+                continue
             try:
-                product = pos.get("product") if isinstance(pos.get("product"), dict) else None
-                if product is None:
+                product = pos.get("product")
+                pid = pos.get("product_id")
+                if isinstance(product, dict):
+                    pid = product.get("id") or pid
+                if pid is None:
                     continue
-                pid = int(pos.get("product_id"))
-                if pid != product_id:
+                if int(pid) != int(product_id):
                     continue
-                return float(pos.get("size"))
-            except Exception:
+                size = pos.get("size")
+                if size is None and isinstance(product, dict):
+                    size = product.get("size")
+                value = DeltaExchangeClient._coerce_float(size)
+                if value is None:
+                    continue
+                return float(value)
+            except (TypeError, ValueError):
                 continue
         return 0.0
 
@@ -194,17 +253,29 @@ class DeltaExchangeClient:
                 payload = resp
             elif hasattr(resp, "json"):
                 payload = await asyncio.to_thread(resp.json)
-            if not isinstance(payload, dict):
-                break
-            if not payload.get("success"):
+            payload = DeltaExchangeClient._unwrap_payload(payload)
+            if isinstance(payload, list):
+                result = payload
+            elif isinstance(payload, dict):
+                if payload.get("success") is False:
+                    break
+                result = payload.get("result") or payload.get("data") or []
+            else:
                 break
 
-            result = payload.get("result") or []
-            if not isinstance(result, list) or not result:
+            if not isinstance(result, list):
+                if isinstance(result, dict):
+                    result = [result]
+                else:
+                    break
+
+            if not result:
                 break
 
             new_count = 0
             for p in result:
+                if not isinstance(p, dict):
+                    continue
                 try:
                     pid = int(p.get("id")) if p.get("id") is not None else None
                 except Exception:
@@ -218,7 +289,6 @@ class DeltaExchangeClient:
                 collected.append(p)
                 new_count += 1
 
-            # Stop if this page had no new products after de-dup.
             if new_count == 0:
                 break
 

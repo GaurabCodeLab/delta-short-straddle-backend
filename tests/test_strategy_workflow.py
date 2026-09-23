@@ -527,6 +527,46 @@ async def test_end_to_end_strategy_exit_closes_all_legs_and_records_history(sett
     assert exchange._positions == []
 
 
+@pytest.mark.asyncio
+async def test_get_index_price_tries_delta_index_aliases_and_nested_payloads():
+    client = DeltaExchangeClient.__new__(DeltaExchangeClient)
+
+    async def fake_call(method_name: str, **kwargs):
+        assert method_name == "get_ticker"
+        identifier = kwargs.get("identifier")
+        if identifier == "BTCUSD":
+            raise ExchangeClientError("wrong symbol")
+        if identifier == ".DEXBTUSD":
+            return {"success": True, "result": {"data": {"last_price": 65000.5}}}
+        raise ExchangeClientError(f"unexpected identifier: {identifier}")
+
+    client._call = fake_call
+
+    assert await client.get_index_price("BTCUSDT") == pytest.approx(65000.5)
+
+
+@pytest.mark.asyncio
+async def test_get_position_size_handles_nested_payload_variants():
+    client = DeltaExchangeClient.__new__(DeltaExchangeClient)
+
+    async def fake_get_open_positions_raw():
+        return [{"product_id": 42, "size": "-1.5", "product": {"id": 42}}]
+
+    client.get_open_positions_raw = fake_get_open_positions_raw
+
+    assert await client.get_position_size(42) == pytest.approx(-1.5)
+
+
+@pytest.mark.asyncio
+async def test_order_executor_extracts_fill_price_from_nested_order_result():
+    exchange = DummyExchange()
+    executor = OrderExecutor(exchange)
+
+    payload = {"result": {"fills": [{"avg_fill_price": 87.5}]}}
+
+    assert executor._extract_price_from_payload(payload) == pytest.approx(87.5)
+
+
 def test_delta_exchange_client_to_dt_parses_iso_string():
     parsed = DeltaExchangeClient._to_dt("2026-12-31T00:00:00Z")
     assert parsed.date().isoformat() == "2026-12-31"

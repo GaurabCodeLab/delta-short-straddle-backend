@@ -23,6 +23,16 @@ class OrderExecutor:
 
     @staticmethod
     def _extract_price_from_payload(payload: Any) -> float | None:
+        if payload is None:
+            return None
+
+        if isinstance(payload, list):
+            for item in payload:
+                price = OrderExecutor._extract_price_from_payload(item)
+                if price is not None:
+                    return price
+            return None
+
         if not isinstance(payload, dict):
             return None
 
@@ -36,27 +46,28 @@ class OrderExecutor:
             "execution_price",
             "avg_fill_price",
             "filled_avg_price",
+            "last_price",
         ):
             if key in payload:
                 candidates.append(payload.get(key))
 
-        result = payload.get("result")
-        if isinstance(result, dict):
-            for key in (
-                "avg_price",
-                "average_price",
-                "price",
-                "fill_price",
-                "last_fill_price",
-                "execution_price",
-                "avg_fill_price",
-                "filled_avg_price",
-            ):
-                if key in result:
-                    candidates.append(result.get(key))
+        for nested_key in ("result", "data", "order", "fill", "fills", "details"):
+            if nested_key in payload:
+                candidates.append(payload.get(nested_key))
 
         for value in candidates:
             if value is None:
+                continue
+            if isinstance(value, list):
+                for item in value:
+                    price = OrderExecutor._extract_price_from_payload(item)
+                    if price is not None:
+                        return price
+                continue
+            if isinstance(value, dict):
+                price = OrderExecutor._extract_price_from_payload(value)
+                if price is not None:
+                    return price
                 continue
             try:
                 return float(value)
@@ -121,6 +132,10 @@ class OrderExecutor:
             try:
                 order_info = await self.exchange.get_order(order_id, product_id=product_id)
                 avg_fill_price = self._extract_price_from_payload(order_info)
+                if avg_fill_price is None:
+                    nested = order_info.get("result") if isinstance(order_info, dict) else None
+                    if isinstance(nested, list):
+                        avg_fill_price = self._extract_price_from_payload(nested)
             except Exception:
                 avg_fill_price = None
 
