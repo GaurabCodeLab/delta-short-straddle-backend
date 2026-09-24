@@ -160,8 +160,13 @@ class StrategyEngine:
 
         last_fill = getattr(self.executor, "last_fill_details", None)
         if isinstance(last_fill, dict) and last_fill.get("product_id") == leg.product_id:
+            api_realized_pnl = last_fill.get("realized_pnl")
             fill_price = last_fill.get("avg_fill_price")
-            if fill_price is not None:
+            if api_realized_pnl is not None:
+                realized_pnl = float(api_realized_pnl)
+                closed_price = float(last_fill.get("exit_price") if last_fill.get("exit_price") is not None else fill_price)
+                filled_qty = last_fill.get("filled_qty", abs(leg.size))
+            elif fill_price is not None:
                 filled_qty = last_fill.get("filled_qty", abs(leg.size))
                 realized_pnl = self._calculate_realized_pnl_from_fill_price(leg, float(fill_price), float(filled_qty))
                 closed_price = float(fill_price)

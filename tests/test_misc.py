@@ -127,6 +127,116 @@ def test_setup_logging_configures_root_handler():
     assert any(isinstance(handler, logging.StreamHandler) for handler in root_handlers)
 
 
+def test_json_log_handler_handles_formatter_failures():
+    class BrokenFormatter(logging.Formatter):
+        def format(self, record):
+            raise ValueError("formatter broke")
+
+    class BrokenTimestampFormatter(logging.Formatter):
+        def formatTime(self, record, datefmt=None):
+            raise RuntimeError("timestamp broke")
+
+    handler = JsonLogHandler(max_records=2)
+    handler.setFormatter(BrokenFormatter())
+    logger = logging.getLogger("test_json_log_handler_broken")
+    logger.setLevel(logging.INFO)
+    logger.addHandler(handler)
+    logger.info("hello")
+    assert handler.latest()[-1]["message"] == "hello"
+
+    handler2 = JsonLogHandler(max_records=2)
+    handler2.setFormatter(BrokenTimestampFormatter())
+    logger2 = logging.getLogger("test_json_log_handler_ts_broken")
+    logger2.setLevel(logging.INFO)
+    logger2.addHandler(handler2)
+    logger2.info("hello")
+    assert handler2.latest()[-1]["timestamp"] is None
+
+
+def test_load_settings_valid_and_missing_env_values(monkeypatch):
+    monkeypatch.setenv("DELTA_API_KEY", "key")
+    monkeypatch.setenv("DELTA_API_SECRET", "secret")
+    monkeypatch.setenv("POLL_INTERVAL_SECONDS", "0.75")
+    monkeypatch.setenv("STRIKE_ADJUSTMENT_THRESHOLD", "1500")
+    monkeypatch.setenv("PROFIT_TARGET", "25")
+    monkeypatch.setenv("STOP_LOSS", "75")
+    monkeypatch.setenv("LOG_LEVEL", "DEBUG")
+    monkeypatch.setenv("DELTA_SSL_VERIFY", "true")
+
+    from src.config import load_settings
+    settings = load_settings()
+    assert settings.api_key == "key"
+    assert settings.api_secret == "secret"
+    assert settings.poll_interval_seconds == 0.75
+    assert settings.strike_adjustment_threshold == 1500.0
+    assert settings.profit_target == 25.0
+    assert settings.stop_loss == 75.0
+    assert settings.log_level == "DEBUG"
+    assert settings.ssl_verify is True
+
+    monkeypatch.delenv("DELTA_API_KEY", raising=False)
+    with pytest.raises(ValueError, match="Missing DELTA_API_KEY"):
+        load_settings()
+
+
+def test_bot_manager_status_falls_back_when_status_message_missing():
+    strategy = DummyStrategy()
+    strategy.state.status_message = None
+    manager = BotManager(strategy)
+
+    payload = manager.status()
+    assert payload["strategy_state"]["status_message"] == "waiting for strategy state"
+
+
+@pytest.mark.asyncio
+async def test_bot_manager_collect_summary_handles_none_closed_positions():
+    class StrategyWithState:
+        def __init__(self) -> None:
+            self.state = StrategyState()
+            self.closed_positions = None
+            self.exchange = DummySummaryExchange()
+
+        async def run(self) -> None:
+            return None
+
+    strategy = StrategyWithState()
+    manager = BotManager(strategy)
+
+    summary = await manager.collect_summary()
+    assert summary["closed_positions"] == []
+    assert summary["realized_pnl"] == 0.0
+
+
+@pytest.mark.asyncio
+async def test_bot_manager_collect_summary_handles_quote_timeout():
+    class SlowQuoteExchange(DummySummaryExchange):
+        async def get_best_quote(self, product_id: int):
+            raise asyncio.TimeoutError("timed out")
+
+    strategy = DummyStrategy()
+    strategy.exchange = SlowQuoteExchange()
+    strategy.state = StrategyState()
+    manager = BotManager(strategy)
+
+    summary = await manager.collect_summary()
+    assert summary["position_count"] == 0
+    assert summary["unrealized_pnl"] == 0.0
+
+
+@pytest.mark.asyncio
+async def test_main_module_runs_uvicorn_when_executed(monkeypatch):
+    calls = []
+
+    import uvicorn
+    monkeypatch.setattr(uvicorn, "run", lambda app, **kwargs: calls.append((app, kwargs)))
+
+    import runpy
+    runpy.run_path("src/main.py", run_name="__main__")
+
+    assert calls
+    assert calls[0][0] == "src.api:app"
+
+
 @pytest.mark.asyncio
 async def test_bot_manager_start_stop_and_status():
     strategy = DummyStrategy()
@@ -341,6 +451,22 @@ def test_build_strategy_uses_configured_components(monkeypatch, settings):
 @pytest.mark.asyncio
 async def test_health_route_returns_ok():
     assert await health() == {"status": "ok"}
+
+
+@pytest.mark.asyncio
+async def test_lifespan_context_manager_registers_and_removes_handler(monkeypatch):
+    import src.api as api_module
+
+    handler = JsonLogHandler(max_records=3)
+    monkeypatch.setattr(api_module, "log_handler", handler)
+    root_logger = logging.getLogger()
+    before_count = len(root_logger.handlers)
+
+    async with api_module.lifespan(None):
+        assert handler in root_logger.handlers
+
+    assert handler not in root_logger.handlers
+    assert len(root_logger.handlers) <= before_count
 
 
 @pytest.mark.asyncio

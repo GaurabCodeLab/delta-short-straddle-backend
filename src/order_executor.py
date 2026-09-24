@@ -22,13 +22,13 @@ class OrderExecutor:
         return str(order_id)
 
     @staticmethod
-    def _extract_price_from_payload(payload: Any) -> float | None:
+    def _extract_fill_price_from_payload(payload: Any) -> float | None:
         if payload is None:
             return None
 
         if isinstance(payload, list):
             for item in payload:
-                price = OrderExecutor._extract_price_from_payload(item)
+                price = OrderExecutor._extract_fill_price_from_payload(item)
                 if price is not None:
                     return price
             return None
@@ -38,20 +38,21 @@ class OrderExecutor:
 
         candidates: list[Any] = []
         for key in (
+            "avg_fill_price",
+            "average_fill_price",
+            "filled_avg_price",
+            "execution_price",
+            "fill_price",
+            "last_fill_price",
             "avg_price",
             "average_price",
             "price",
-            "fill_price",
-            "last_fill_price",
-            "execution_price",
-            "avg_fill_price",
-            "filled_avg_price",
             "last_price",
         ):
             if key in payload:
                 candidates.append(payload.get(key))
 
-        for nested_key in ("result", "data", "order", "fill", "fills", "details"):
+        for nested_key in ("result", "data", "order", "fill", "fills", "details", "meta_data"):
             if nested_key in payload:
                 candidates.append(payload.get(nested_key))
 
@@ -60,12 +61,12 @@ class OrderExecutor:
                 continue
             if isinstance(value, list):
                 for item in value:
-                    price = OrderExecutor._extract_price_from_payload(item)
+                    price = OrderExecutor._extract_fill_price_from_payload(item)
                     if price is not None:
                         return price
                 continue
             if isinstance(value, dict):
-                price = OrderExecutor._extract_price_from_payload(value)
+                price = OrderExecutor._extract_fill_price_from_payload(value)
                 if price is not None:
                     return price
                 continue
@@ -73,6 +74,101 @@ class OrderExecutor:
                 return float(value)
             except (TypeError, ValueError):
                 continue
+        return None
+
+    @staticmethod
+    def _extract_exit_price_from_payload(payload: Any) -> float | None:
+        if payload is None:
+            return None
+
+        if isinstance(payload, list):
+            for item in payload:
+                price = OrderExecutor._extract_exit_price_from_payload(item)
+                if price is not None:
+                    return price
+            return None
+
+        if not isinstance(payload, dict):
+            return None
+
+        meta = payload.get("meta_data")
+        if isinstance(meta, dict):
+            for key in ("avg_exit_price", "average_exit_price", "exit_price"):
+                if key in meta:
+                    try:
+                        return float(meta[key])
+                    except (TypeError, ValueError):
+                        continue
+
+        candidates: list[Any] = []
+        for key in ("avg_exit_price", "average_exit_price", "exit_price"):
+            if key in payload:
+                candidates.append(payload.get(key))
+
+        for nested_key in ("result", "data", "order", "fill", "fills", "details", "meta_data"):
+            if nested_key in payload:
+                candidates.append(payload.get(nested_key))
+
+        for value in candidates:
+            if value is None:
+                continue
+            if isinstance(value, list):
+                for item in value:
+                    price = OrderExecutor._extract_exit_price_from_payload(item)
+                    if price is not None:
+                        return price
+                continue
+            if isinstance(value, dict):
+                price = OrderExecutor._extract_exit_price_from_payload(value)
+                if price is not None:
+                    return price
+                continue
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                continue
+        return None
+
+    @staticmethod
+    def _extract_price_from_payload(payload: Any) -> float | None:
+        exit_price = OrderExecutor._extract_exit_price_from_payload(payload)
+        if exit_price is not None:
+            return exit_price
+        return OrderExecutor._extract_fill_price_from_payload(payload)
+
+    @staticmethod
+    def _extract_realized_pnl_from_payload(payload: Any) -> float | None:
+        if payload is None:
+            return None
+
+        if isinstance(payload, list):
+            for item in payload:
+                pnl = OrderExecutor._extract_realized_pnl_from_payload(item)
+                if pnl is not None:
+                    return pnl
+            return None
+
+        if not isinstance(payload, dict):
+            return None
+
+        if "pnl" in payload:
+            try:
+                return float(payload["pnl"])
+            except (TypeError, ValueError):
+                pass
+
+        meta = payload.get("meta_data")
+        if isinstance(meta, dict) and "pnl" in meta:
+            try:
+                return float(meta["pnl"])
+            except (TypeError, ValueError):
+                pass
+
+        for nested_key in ("result", "data", "order", "fill", "fills", "details"):
+            if nested_key in payload:
+                pnl = OrderExecutor._extract_realized_pnl_from_payload(payload[nested_key])
+                if pnl is not None:
+                    return pnl
         return None
 
     async def execute_market_single_submission_with_fill_confirmation(
@@ -127,22 +223,35 @@ class OrderExecutor:
         inferred = max(0.0, dir_sign * (post_size - pre_size))
         confirmed = min(size, inferred)
 
-        avg_fill_price = self._extract_price_from_payload(place_resp)
-        if avg_fill_price is None and hasattr(self.exchange, "get_order"):
+        avg_fill_price = self._extract_fill_price_from_payload(place_resp)
+        exit_price = self._extract_exit_price_from_payload(place_resp)
+        api_realized_pnl = self._extract_realized_pnl_from_payload(place_resp)
+        if hasattr(self.exchange, "get_order"):
             try:
                 order_info = await self.exchange.get_order(order_id, product_id=product_id)
-                avg_fill_price = self._extract_price_from_payload(order_info)
                 if avg_fill_price is None:
-                    nested = order_info.get("result") if isinstance(order_info, dict) else None
-                    if isinstance(nested, list):
-                        avg_fill_price = self._extract_price_from_payload(nested)
+                    avg_fill_price = self._extract_fill_price_from_payload(order_info)
+                if exit_price is None:
+                    exit_price = self._extract_exit_price_from_payload(order_info)
+                if api_realized_pnl is None:
+                    api_realized_pnl = self._extract_realized_pnl_from_payload(order_info)
+                if exit_price is None and avg_fill_price is not None:
+                    exit_price = avg_fill_price
             except Exception:
-                avg_fill_price = None
+                pass
+
+        if exit_price is None:
+            exit_price = avg_fill_price
+
+        if (api_realized_pnl is not None or exit_price is not None or avg_fill_price is not None) and size > 0:
+            confirmed = float(size)
 
         self.last_fill_details = {
             "product_id": product_id,
             "filled_qty": float(confirmed),
             "avg_fill_price": float(avg_fill_price) if avg_fill_price is not None else None,
+            "realized_pnl": float(api_realized_pnl) if api_realized_pnl is not None else None,
+            "exit_price": float(exit_price) if exit_price is not None else None,
         }
 
         LOGGER.info(

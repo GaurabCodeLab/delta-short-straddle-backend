@@ -722,6 +722,21 @@ async def test_order_executor_handles_reduce_only_no_position(settings):
 
 
 @pytest.mark.asyncio
+async def test_order_executor_extracts_api_meta_data_pnl_and_exit_price(settings):
+    exchange = DummyExchange()
+    executor = OrderExecutor(exchange)
+    response = {
+        "product_id": 1,
+        "side": "buy",
+        "meta_data": {"avg_exit_price": "85", "pnl": "0.026"},
+        "avg_fill_price": "85",
+    }
+
+    assert executor._extract_price_from_payload(response) == pytest.approx(85.0)
+    assert executor._extract_realized_pnl_from_payload(response) == pytest.approx(0.026)
+
+
+@pytest.mark.asyncio
 async def test_record_realized_pnl_prefers_execution_fill_price_over_quote(settings):
     exchange = DummyExchange()
     positions = PositionManager(exchange)
@@ -734,6 +749,27 @@ async def test_record_realized_pnl_prefers_execution_fill_price_over_quote(setti
     await engine._record_realized_pnl_for_close(leg)
 
     assert engine._realized_pnl == pytest.approx(10.0)
+
+
+@pytest.mark.asyncio
+async def test_record_realized_pnl_prefers_meta_data_values_when_order_close_reports_them(settings):
+    exchange = DummyExchange()
+    positions = PositionManager(exchange)
+    executor = DummyOrderExecutor(exchange)
+    executor.last_fill_details = {
+        "product_id": 1,
+        "filled_qty": 1.0,
+        "avg_fill_price": 90.0,
+        "exit_price": 85.0,
+        "realized_pnl": 0.026,
+    }
+    engine = StrategyEngine(exchange, positions, executor, settings)
+    leg = make_option_leg(1, "P-30000", "put", 30000.0, -1.0, 100.0)
+
+    await engine._record_realized_pnl_for_close(leg)
+
+    assert engine._realized_pnl == pytest.approx(0.026)
+    assert engine.closed_positions[-1]["realized_pnl"] == pytest.approx(0.026)
 
 
 @pytest.mark.asyncio

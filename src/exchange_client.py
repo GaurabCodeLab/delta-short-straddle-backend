@@ -404,9 +404,23 @@ class DeltaExchangeClient:
         resp = await self._call("order_history", query=query, page_size=1)
 
         if isinstance(resp, dict):
+            for key in ("result", "data"):
+                value = resp.get(key)
+                if isinstance(value, list) and value:
+                    return value[0]
+                if isinstance(value, dict):
+                    nested = value.get("result") or value.get("data")
+                    if isinstance(nested, list) and nested:
+                        return nested[0]
+                    if value.get("id") is not None:
+                        return value
             result = resp.get("result")
-            if isinstance(result, list) and result:
-                return result[0]
+            if isinstance(result, dict):
+                if result.get("id") is not None:
+                    return result
+                nested = result.get("result") or result.get("data")
+                if isinstance(nested, list) and nested:
+                    return nested[0]
         return {}
 
     async def parse_option_positions(self) -> List[OptionLeg]:
