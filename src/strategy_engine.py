@@ -327,13 +327,13 @@ class StrategyEngine:
                 self._atm_reference_strike,
             )
             qty = abs(straddle.call_leg.size)
-            await self._record_realized_pnl_for_close(straddle.call_leg)
             await self.executor.execute_market_single_submission_with_fill_confirmation(
                 product_id=straddle.call_leg.product_id,
                 side="buy",
                 size=qty,
                 reduce_only=True,
             )
+            await self._record_realized_pnl_for_close(straddle.call_leg)
             new_strike = self._atm_reference_strike + 2 * threshold
             new_product = await self.positions.get_option_product_for_strike(
                 option_type="call",
@@ -359,13 +359,13 @@ class StrategyEngine:
                 self._atm_reference_strike,
             )
             qty = abs(straddle.put_leg.size)
-            await self._record_realized_pnl_for_close(straddle.put_leg)
             await self.executor.execute_market_single_submission_with_fill_confirmation(
                 product_id=straddle.put_leg.product_id,
                 side="buy",
                 size=qty,
                 reduce_only=True,
             )
+            await self._record_realized_pnl_for_close(straddle.put_leg)
             new_strike = self._atm_reference_strike - 2 * threshold
             new_product = await self.positions.get_option_product_for_strike(
                 option_type="put",
@@ -388,13 +388,13 @@ class StrategyEngine:
     async def _convert_strangle_to_straddle(self, strangle: ShortStrangle, current_index_price: float) -> float:
         if current_index_price >= strangle.call_leg.strike:
             qty = abs(strangle.put_leg.size)
-            await self._record_realized_pnl_for_close(strangle.put_leg)
             await self.executor.execute_market_single_submission_with_fill_confirmation(
                 product_id=strangle.put_leg.product_id,
                 side="buy",
                 size=qty,
                 reduce_only=True,
             )
+            await self._record_realized_pnl_for_close(strangle.put_leg)
             new_strike = float(strangle.call_leg.strike)
             new_product = await self.positions.get_option_product_for_strike(
                 option_type="put",
@@ -415,13 +415,13 @@ class StrategyEngine:
 
         if current_index_price <= strangle.put_leg.strike:
             qty = abs(strangle.call_leg.size)
-            await self._record_realized_pnl_for_close(strangle.call_leg)
             await self.executor.execute_market_single_submission_with_fill_confirmation(
                 product_id=strangle.call_leg.product_id,
                 side="buy",
                 size=qty,
                 reduce_only=True,
             )
+            await self._record_realized_pnl_for_close(strangle.call_leg)
             new_strike = float(strangle.put_leg.strike)
             new_product = await self.positions.get_option_product_for_strike(
                 option_type="call",
