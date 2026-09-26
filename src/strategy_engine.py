@@ -4,6 +4,7 @@ import asyncio
 import logging
 import math
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Optional
 
 from src.config import Settings
@@ -192,6 +193,7 @@ class StrategyEngine:
                 "size": float(filled_qty),
                 "entry_price": float(leg.entry_price),
                 "closed_price": closed_price,
+                "closed_time": datetime.utcnow().isoformat() + "Z",
                 "realized_pnl": float(realized_pnl),
             }
         )

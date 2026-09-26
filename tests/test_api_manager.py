@@ -91,12 +91,14 @@ async def test_collect_summary_includes_closed_positions_with_realized_pnl():
         "size": 1.0,
         "entry_price": 10.0,
         "closed_price": 8.0,
+        "closed_time": "2026-09-27T12:34:56Z",
         "realized_pnl": 2.0,
     }]
     manager = BotManager(strategy)
 
     summary = await manager.collect_summary()
     assert summary["closed_positions"][0]["closed_price"] == 8.0
+    assert summary["closed_positions"][0]["closed_time"] == "2026-09-27T12:34:56Z"
     assert summary["closed_positions"][0]["realized_pnl"] == 2.0
     assert summary["realized_pnl"] == 2.0
 

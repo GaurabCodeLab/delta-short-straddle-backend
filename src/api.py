@@ -162,6 +162,7 @@ class BotManager:
                     "size": entry.get("size"),
                     "entry_price": entry.get("entry_price"),
                     "closed_price": entry.get("closed_price"),
+                    "closed_time": entry.get("closed_time"),
                     "realized_pnl": entry.get("realized_pnl"),
                 }
             )
