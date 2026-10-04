@@ -126,6 +126,27 @@ async def test_get_open_positions_raw_and_position_size_handle_failures():
 
 
 @pytest.mark.asyncio
+async def test_get_position_size_skips_malformed_rows_and_reads_nested_size():
+    client = object.__new__(DeltaExchangeClient)
+
+    async def get_positions():
+        return [
+            None,
+            {},
+            {"product_id": "invalid", "size": "1"},
+            {"product_id": "3", "size": "invalid"},
+            {"product_id": "4", "size": None, "product": {"id": 4, "size": "invalid"}},
+            {"product_id": "5", "size": None, "product": {"id": 5, "size": "-2.5"}},
+        ]
+
+    client.get_open_positions_raw = get_positions
+    client.get_position_size = DeltaExchangeClient.get_position_size.__get__(client, DeltaExchangeClient)
+
+    assert await client.get_position_size(5) == -2.5
+    assert await client.get_position_size(99) == 0.0
+
+
+@pytest.mark.asyncio
 async def test_parse_option_positions_skips_invalid_entries_and_keeps_valid_one():
     class C(DeltaExchangeClient):
         def __init__(self):
@@ -223,6 +244,27 @@ async def test_exchange_client_handles_nested_result_data_and_empty_results():
     product_client.get_products_raw = DeltaExchangeClient.get_products_raw.__get__(product_client, product_client.__class__)
     products = await product_client.get_products_raw()
     assert [p["id"] for p in products] == ["1", "2", "3"]
+
+
+@pytest.mark.asyncio
+async def test_get_open_positions_raw_decodes_response_objects():
+    expected = [{"product_id": 12, "size": "-3"}]
+
+    class Response:
+        def json(self):
+            return {"success": True, "result": {"positions": expected}}
+
+    class Client(DeltaExchangeClient):
+        def __init__(self):
+            pass
+
+        async def _call(self, method_name: str, **kwargs):
+            return Response()
+
+    client = Client()
+    client.get_open_positions_raw = DeltaExchangeClient.get_open_positions_raw.__get__(client, Client)
+
+    assert await client.get_open_positions_raw() == expected
 
 
 @pytest.mark.asyncio
@@ -416,3 +458,79 @@ async def test_order_executor_handles_order_history_error_and_direct_close_paylo
     assert OrderExecutor._extract_realized_pnl_from_payload(payload) == pytest.approx(3.25)
     assert OrderExecutor._extract_exit_price_from_payload(payload) == pytest.approx(66.0)
     assert OrderExecutor._extract_fill_price_from_payload([{"fill_price": "44.4"}, {"avg_fill_price": "45.5"}]) == pytest.approx(44.4)
+
+
+@pytest.mark.asyncio
+async def test_get_order_normalizes_nested_dict_responses_and_empty_payloads():
+    responses = [
+        {"data": {"result": [{"id": "from-data-result"}]}},
+        {"data": {"id": "from-data-id"}},
+        {"result": {"id": "from-result-id"}},
+        {"result": {"data": [{"id": "from-result-data"}]}},
+        {"unexpected": True},
+    ]
+
+    class Client(DeltaExchangeClient):
+        def __init__(self):
+            self.responses = iter(responses)
+
+        async def _call(self, method_name: str, **kwargs):
+            return next(self.responses)
+
+    client = Client()
+    client.get_order = DeltaExchangeClient.get_order.__get__(client, Client)
+
+    assert (await client.get_order("a"))["id"] == "from-data-result"
+    assert (await client.get_order("b"))["id"] == "from-data-id"
+    assert (await client.get_order("c"))["id"] == "from-result-id"
+    assert (await client.get_order("d"))["id"] == "from-result-data"
+    assert await client.get_order("missing") == {}
+
+
+@pytest.mark.asyncio
+async def test_get_products_raw_retries_without_query_and_rejects_error_payload():
+    class Client(DeltaExchangeClient):
+        def __init__(self):
+            self.calls = []
+
+        async def _call(self, method_name: str, **kwargs):
+            self.calls.append(kwargs)
+            query = kwargs.get("query")
+            if query and query.get("page_number") == 1:
+                raise TypeError("query unsupported")
+            if not query:
+                return {"success": True, "result": [{"id": "7", "symbol": "OPT-7"}]}
+            return {"success": True, "result": []}
+
+    client = Client()
+    client.get_products_raw = DeltaExchangeClient.get_products_raw.__get__(client, Client)
+
+    assert await client.get_products_raw() == [{"id": "7", "symbol": "OPT-7"}]
+    assert len(client.calls) == 3
+    assert "query" not in client.calls[1]
+
+    class ErrorClient(DeltaExchangeClient):
+        def __init__(self):
+            pass
+
+        async def _call(self, method_name: str, **kwargs):
+            return {"success": False, "message": "denied"}
+
+    error_client = ErrorClient()
+    error_client.get_products_raw = DeltaExchangeClient.get_products_raw.__get__(error_client, ErrorClient)
+    with pytest.raises(ExchangeClientError, match="Unexpected products response shape"):
+        await error_client.get_products_raw()
+
+
+def test_order_executor_skips_invalid_metadata_and_finds_nested_values():
+    assert OrderExecutor._extract_fill_price_from_payload(
+        {"avg_fill_price": "bad", "fills": [None, {"fill_price": "44.5"}]}
+    ) == pytest.approx(44.5)
+    assert OrderExecutor._extract_exit_price_from_payload(
+        {"meta_data": {"avg_exit_price": "bad"}, "details": {"exit_price": "45.5"}}
+    ) == pytest.approx(45.5)
+    assert OrderExecutor._extract_realized_pnl_from_payload(
+        {"pnl": "bad", "meta_data": {"pnl": "also-bad"}, "details": {"pnl": "2.25"}}
+    ) == pytest.approx(2.25)
+    assert OrderExecutor._extract_fill_price_from_payload("not-a-payload") is None
+    assert OrderExecutor._extract_realized_pnl_from_payload(None) is None
